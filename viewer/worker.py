@@ -1,6 +1,7 @@
 from queue import Empty, Full
 import time
 
+from .console import ConsoleStop, log_stop
 from .generator import DEFAULT_PERIOD_MS, build_wave, max_frequency, validated_period
 from .hardware import Hardware, adapters
 from .pdo import raw_voltage, validated_voltage, volts
@@ -48,15 +49,19 @@ class Worker:
         self.reason = reason
 
     def close_bus(self):
+        confirmed = None
         if self.bus:
             bus, self.bus = self.bus, None
             try:
-                self.zero = "零值已收到 WKC 确认" if bus.close() else "输出状态未知"
+                confirmed = bus.close()
+                self.zero = "零值已收到 WKC 确认" if confirmed else "输出状态未知"
             except Exception:
+                confirmed = False
                 self.zero = "输出状态未知"
             self.devices = bus.devices
         self.expected = self.wkc = self.last_exchange = None
         self.good_since = 0
+        return confirmed
 
     def status(self):
         return dict(mode="LIVE", connection=self.connection, armed=bool(self.owner),
@@ -252,12 +257,16 @@ class Worker:
             time.sleep(max(0, (deadline - time.perf_counter_ns()) / 1e9))
 
 
-def run_worker(*args):
-    worker = Worker(*args)
-    try:
-        worker.run()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        worker.lock()
-        worker.close_bus()
+def run_worker(commands, events, telemetry, lease, stop, cleanup_done):
+    worker = Worker(commands, events, telemetry, lease, stop)
+    with ConsoleStop(lambda source: worker.stop.set()):
+        try:
+            worker.run()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            worker.lock()
+            confirmed = worker.close_bus()
+            zero = "not_connected" if confirmed is None else "confirmed" if confirmed else "unknown"
+            log_stop("worker_stop", zero=zero)
+            cleanup_done.set()

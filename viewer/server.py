@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .console import log_stop
 from .generator import DEFAULT_PERIOD_MS
 from .timing import TimingWindow
 from .worker import run_worker
@@ -44,7 +45,9 @@ class Service:
         ctx = mp.get_context("spawn")
         self.commands, self.events, self.telemetry = ctx.Queue(8), ctx.Queue(32), ctx.Queue(16)
         self.lease, self.stop = ctx.Array("q", 2), ctx.Event()
-        self.worker = ctx.Process(target=run_worker, args=(self.commands, self.events, self.telemetry, self.lease, self.stop))
+        self.cleanup_done = ctx.Event()
+        self.worker = ctx.Process(target=run_worker, args=(self.commands, self.events, self.telemetry,
+                                                          self.lease, self.stop, self.cleanup_done))
         self.status = {"mode": "LIVE", "connection": "DISCONNECTED", "period_ms": DEFAULT_PERIOD_MS}
         self.timing = TimingWindow()
         self.timing_summary = self.timing.summarize()
@@ -170,12 +173,16 @@ async def lifespan(app):
         yield
     finally:
         service.stop.set()
-        await asyncio.to_thread(service.worker.join, 6)
+        await asyncio.to_thread(service.worker.join, 2.5)
         pump.cancel()
         await asyncio.gather(pump, return_exceptions=True)
         if service.worker.is_alive():
+            log_stop("worker_stop_timeout", worker_pid=service.worker.pid, zero="unknown")
             service.worker.terminate()
-            await asyncio.to_thread(service.worker.join, 2)
+            await asyncio.to_thread(service.worker.join, 0.25)
+        elif not service.cleanup_done.is_set():
+            log_stop("worker_stop_failed", worker_pid=service.worker.pid, zero="unknown",
+                     exitcode=service.worker.exitcode)
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1"])

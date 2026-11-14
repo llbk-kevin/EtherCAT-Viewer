@@ -2,7 +2,7 @@
 
 Windows 10/11 x64 本地仪表盘。支持 Beckhoff EK1100 → EL3104 → EL4134。现场验证接线为 AO1 → AI1、AO2 → AI3、AO4 → AI4，均为双线回环。EL9011 是末端盖。
 
-在项目目录运行启动脚本，打开 [EtherCAT Viewer](http://127.0.0.1:8765/)。
+双击项目目录中的 `start-viewer.cmd`，在 **EtherCAT Viewer 后端** 窗口查看启动和运行日志，然后打开 [EtherCAT Viewer](http://127.0.0.1:8765/)。也可以在现有 PowerShell 窗口运行：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
@@ -16,7 +16,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
 
 「通信诊断」支持 1–50 ms 的整数目标周期，默认 10 ms。在线切换保留波形相位和直流值。如果任一运行中的波形超出新周期允许的频率，旧设置继续生效。频率下限 0.01 Hz，上限为 100 Hz 和目标更新率的四分之一中的较小值；每个波形周期少于 20 个输出更新点时，曲线可能出现可见台阶。
 
-万用表参考值、增益和偏移保存在当前浏览器。曲线与输出使用设备原始量程换算。退出服务用 Ctrl+C。
+万用表参考值、增益和偏移保存在当前浏览器。曲线与输出使用设备原始量程换算。停止服务时，在后端窗口按 **Ctrl+C** 或点击右上角 **×**。服务会停止波形并尝试清零、断开 EtherCAT。关窗后可在 `logs/backend-shutdown.jsonl` 查看退出结果，其中 `confirmed` 表示零值已获 WKC 确认，`unknown` 表示未能确认，`not_connected` 表示停止时未连接总线。Windows 限制关闭窗口的清理时间，通信中断时由端子的 100 ms 看门狗保护。
 
 连接、WKC、状态码和 PDO 表在「通信诊断」中。周期间隔是相邻两次 PDO 交换起始的间隔，主站收发耗时是单轮发送到接收返回的用时。两项各显示近 10 秒统计。调度漏期、WKC 异常和网页推送遗漏各自统计。WKC（Working Counter，工作计数器）是每轮数据交换的处理回执。页面以实际值 / 预期值显示，例如 3 / 3 表示这一轮读写都得到了确认。连接失败时先确认 100 Mbps 链路、Npcap 兼容模式和选中的接口，再看具体 CoE、PDO 或 AL 状态错误。如果适配器打开失败且 Npcap 限制管理员访问，从管理员 PowerShell 运行启动命令。真实连接由独立通信进程独占，运行零输出诊断时先断开网页实机连接。
 
