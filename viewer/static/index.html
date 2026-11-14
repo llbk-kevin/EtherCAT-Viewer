@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>EtherCAT Viewer</title>
+  <link rel="stylesheet" href="/static/vendor/uPlot.min.css">
+  <link rel="stylesheet" href="/static/style.css">
+  <script defer src="/static/vendor/uPlot.iife.min.js"></script>
+  <script defer src="/static/app.js"></script>
+  <script defer src="/static/reference.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><i aria-hidden="true"></i><h1>EtherCAT Viewer</h1></div>
+    <div class="indicators"><strong id="mode">SIMULATION</strong><span id="connection">启动中</span></div>
+  </header>
+  <main>
+    <section class="connection panel" aria-label="连接管理">
+      <div class="network">
+        <label for="adapters">EtherCAT 接口</label>
+        <div class="group"><select id="adapters"><option value="">读取网卡中…</option></select><button id="refresh">刷新</button></div>
+      </div>
+      <div class="group">
+        <button id="claim">取得控制权</button>
+        <button id="connect" class="primary">连接实机</button>
+        <button id="disconnect">断开</button>
+        <button id="simulate">切换模拟</button>
+      </div>
+    </section>
+    <p id="message" role="status" hidden></p>
+    <div class="grid">
+      <section class="panel trace" aria-labelledby="trace-title">
+        <div class="panel-head"><div><h2 id="trace-title">模拟量输入</h2><p>电压 / V · 最近 30 秒</p></div>
+          <div class="group"><button id="record">开始记录</button><a id="export" href="/api/recording" hidden>下载 CSV</a></div>
+        </div>
+        <div id="plot" aria-label="四路电压随时间变化的曲线"></div>
+        <div id="inputs" class="input-grid"></div>
+      </section>
+      <section class="panel output" aria-labelledby="output-title">
+        <div class="panel-head"><div><h2 id="output-title">模拟量输出</h2><p>AO1 / AO4 · −1 至 +1 V</p></div></div>
+        <div class="lock"><strong id="lock">输出已锁定</strong><p id="zero-state">等待数据</p></div>
+        <div class="group actions"><button id="arm" class="primary">解锁输出</button><button id="zero" class="danger">清零并锁定</button></div>
+        <div id="outputs"></div>
+      </section>
+    </div>
+    <section class="panel diagnostic" aria-labelledby="diag-title">
+      <div class="panel-head"><div><h2 id="diag-title">总线诊断</h2><p id="timing">通信周期目标 10 ms</p></div><span id="wkc">WKC — / —</span></div>
+      <div class="table-wrap"><table><thead><tr><th>从站</th><th>厂商 / 产品</th><th>Revision</th><th>AL 状态</th><th>状态码</th></tr></thead><tbody id="devices"></tbody></table></div>
+      <details id="mapping" hidden><summary>PDO 映射与看门狗配置</summary><pre id="mapping-text"></pre></details>
+      <details class="reference">
+        <summary>万用表记录与校准参数</summary>
+        <p>测量值与参数保存在当前浏览器。当前曲线和输出使用设备原始量程换算。</p>
+        <form id="reference-form">
+          <table>
+            <thead><tr><th>通道</th><th>零指令实测 / mV</th><th>增益</th><th>偏移 / V</th></tr></thead>
+            <tbody>
+              <tr><td>AO1</td><td><input name="zero1" aria-label="AO1 零指令实测" type="number" step="any" required></td><td><input name="gain1" aria-label="AO1 增益" type="number" min="0.001" step="any" required></td><td><input name="offset1" aria-label="AO1 偏移" type="number" step="any" required></td></tr>
+              <tr><td>AO4</td><td><input name="zero4" aria-label="AO4 零指令实测" type="number" step="any" required></td><td><input name="gain4" aria-label="AO4 增益" type="number" min="0.001" step="any" required></td><td><input name="offset4" aria-label="AO4 偏移" type="number" step="any" required></td></tr>
+            </tbody>
+          </table>
+          <button type="submit">保存参数</button> <span id="reference-saved" role="status"></span>
+        </form>
+      </details>
+    </section>
+  </main>
+</body>
+</html>

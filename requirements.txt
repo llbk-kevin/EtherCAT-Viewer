@@ -1,0 +1,4 @@
+pysoem==1.1.13
+fastapi==0.162.7
+uvicorn==0.54.0
+websockets==17.4
