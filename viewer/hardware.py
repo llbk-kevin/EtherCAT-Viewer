@@ -171,8 +171,12 @@ class Hardware:
 
     def exchange(self, values):
         self.ao_slave.output = self.output.encode(values)
+        self.last_send_ns = time.perf_counter_ns()
         self.master.send_processdata()
-        return self.master.receive_processdata(2000)
+        try:
+            return self.master.receive_processdata(2000)
+        finally:
+            self.last_receive_ns = time.perf_counter_ns()
 
     def check_op(self):
         self.devices = identities(self.master)

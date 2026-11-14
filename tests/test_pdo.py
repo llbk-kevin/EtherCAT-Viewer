@@ -34,7 +34,7 @@ def test_output_respects_mapping_order():
     codec = Mapping([Entry(index, 1, 16, i * 16) for i, index in enumerate(reversed(AO))], 8, True)
     assert struct.unpack("<4h", codec.encode([1, 0, 0, -0.5])) == (-1638, 0, 0, 3277)
 
-@pytest.mark.parametrize("value", [True, "0.5", float("nan"), float("inf"), -1.001, 2, None])
+@pytest.mark.parametrize("value", [True, "0.5", float("nan"), float("inf"), -10.001, 10.001, None])
 def test_output_validation(value):
     with pytest.raises(ValueError):
         validated_voltage(value)

@@ -17,16 +17,19 @@ def test_bus_fault_invalidates_sample_and_clears_nonzero_command(fault):
     w = worker()
     now = time.perf_counter_ns()
     w.lease[:] = [1, now]
-    w.mode, w.connection, w.owner = "LIVE", "OP", 1
+    w.connection, w.owner = "OP", 1
     w.values[0] = 0.5
     bus = w.bus = Mock()
     w.expected = 3
     bus.exchange.return_value = 0 if fault == "wkc" else 3
     bus.check_op.return_value = False
     bus.close.return_value = False
+    bus.last_send_ns = now
+    bus.last_receive_ns = now + 100_000
     sample = w.cycle(now)
     assert sample["ai"] == [None] * 4
-    assert sample["ao"] == [0] * 4
+    assert sample["ao"] == [None] * 4 and not sample["ao_valid"]
+    assert w.values == [0] * 4
     assert w.connection == "FAULT" and not w.owner
     assert w.zero == "输出状态未知"
     bus.close.assert_called_once()
@@ -36,7 +39,8 @@ def test_expired_controller_lease_cancels_wave_and_output():
     now = time.perf_counter_ns()
     w.lease[:] = [1, now - LEASE_NS]
     w.owner, w.values[3], w.wave[0] = 1, 0.8, (1.0, now)
-    assert w.cycle(now)["ao"] == [0] * 4
+    assert w.cycle(now)["ao"] == [None] * 4
+    assert w.values == [0] * 4
     assert w.owner == 0 and not w.wave
 
 def test_non_default_representation_is_rejected():

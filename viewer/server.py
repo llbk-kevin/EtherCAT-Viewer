@@ -17,6 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .generator import DEFAULT_PERIOD_MS
+from .timing import TimingWindow
 from .worker import run_worker
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,7 +35,8 @@ def csv_rows(samples):
     for sample in samples:
         writer.writerow([sample["seq"], sample["time_ns"], sample["mode"], sample["wkc"],
                          sample["expected_wkc"], *sample["raw"], *sample["ai"],
-                         *sample["valid"], *(json.dumps(f) for f in sample["flags"]), *sample["ao"]])
+                         *sample["valid"], *(json.dumps(f) for f in sample["flags"]), *sample["ao"], sample["ao_valid"],
+                         sample["period_ms"], sample["interval_ms"], sample["roundtrip_ms"]])
     return stream.getvalue()
 
 class Service:
@@ -42,8 +45,13 @@ class Service:
         self.commands, self.events, self.telemetry = ctx.Queue(8), ctx.Queue(32), ctx.Queue(16)
         self.lease, self.stop = ctx.Array("q", 2), ctx.Event()
         self.worker = ctx.Process(target=run_worker, args=(self.commands, self.events, self.telemetry, self.lease, self.stop))
-        self.status = {"mode": "SIMULATION", "connection": "STARTING", "ao": [0] * 4}
+        self.status = {"mode": "LIVE", "connection": "DISCONNECTED", "period_ms": DEFAULT_PERIOD_MS}
+        self.timing = TimingWindow()
+        self.timing_summary = self.timing.summarize()
+        self.last_summary = 0
+        self.connection_session = 0
         self.clients = {}
+        self.viewer_drops = {}
         self.controller = None
         self.generation = 0
         self.pending = {}
@@ -61,6 +69,7 @@ class Service:
 
     def detach(self, token):
         self.clients.pop(token, None)
+        self.viewer_drops.pop(token, None)
         if self.controller == token:
             self.controller = None
             self.heartbeat()
@@ -71,12 +80,14 @@ class Service:
         folder = ROOT / "recordings"
         folder.mkdir(exist_ok=True)
         name = f"{self.status['mode'].lower()}-{datetime.now():%Y%m%d-%H%M%S-%f}.csv"
-        self.recording = folder / name
+        target = folder / name
         self.record_error = None
-        with self.recording.open("x", encoding="utf-8-sig", newline="") as stream:
+        with target.open("x", encoding="utf-8-sig", newline="") as stream:
             csv.writer(stream).writerow(["seq", "monotonic_ns", "mode", "wkc", "expected_wkc",
                                         *[f"{field}{i}" for field in ("raw", "ai_v", "valid", "flags", "ao_v")
-                                          for i in range(1, 5)]])
+                                          for i in range(1, 5)],
+                                        "ao_valid", "target_period_ms", "interval_ms", "roundtrip_ms"])
+        self.recording = target
 
     def record_stop(self):
         self.last_recording, self.recording = self.recording or self.last_recording, None
@@ -84,10 +95,10 @@ class Service:
     def status_for(self, token):
         return dict(self.status, controller=self.controller == token, controller_busy=bool(self.controller),
                     recording=self.recording is not None, export=self.last_recording is not None,
-                    record_error=self.record_error)
+                    record_error=self.record_error, timing=self.timing_summary,
+                    viewer_drops=self.viewer_drops.get(token, 0))
 
     async def pump(self):
-        last_mode = None
         while True:
             for _ in range(32):
                 try:
@@ -107,16 +118,20 @@ class Service:
             collected = []
             for packet in batches:
                 self.status = packet["status"]
-                mode = self.status["mode"]
-                if mode != last_mode:
-                    self.recent.clear()
-                    collected.clear()
-                    if last_mode is not None:
-                        self.record_stop()
-                    last_mode = mode
+                if self.status["session"] != self.connection_session:
+                    self.connection_session = self.status["session"]
+                    self.timing = TimingWindow()
+                    self.timing_summary = self.timing.summarize()
+                    self.last_summary = 0
                 collected.extend(packet["samples"])
+            now = time.monotonic()
+            if batches:
+                self.last_update = now
             if collected:
-                self.last_update = time.monotonic()
+                self.timing.add(s for s in collected if s["session"] == self.connection_session)
+                if now - self.last_summary >= 0.25 or self.status["connection"] != "OP":
+                    self.timing_summary = self.timing.summarize()
+                    self.last_summary = now
                 self.recent.extend(collected)
                 if self.recording:
                     try:
@@ -124,16 +139,22 @@ class Service:
                     except OSError as exc:
                         self.record_error = str(exc)
                         self.record_stop()
-            elif not self.worker.is_alive():
+            if not self.worker.is_alive():
                 self.status.update(connection="FAULT", armed=False, ready=False,
                                    reason="EtherCAT 工作进程已退出", zero="输出状态未知")
             elif self.last_update and time.monotonic() - self.last_update > 1:
                 self.status.update(connection="STALE", armed=False, ready=False,
                                    reason="等待通信进程更新", zero="输出状态未知")
-            if collected or self.status["connection"] in ("STALE", "FAULT"):
+            if self.status["connection"] != "OP" and self.recording:
+                self.record_stop()
+            if batches or (self.status["connection"] in ("STALE", "FAULT")
+                           and now - self.last_summary >= 0.25):
+                if not batches:
+                    self.last_summary = now
                 for token, queue in tuple(self.clients.items()):
                     if queue.full():
-                        queue.get_nowait()
+                        skipped = queue.get_nowait()["samples"]
+                        self.viewer_drops[token] += len(skipped)
                     queue.put_nowait(dict(kind="samples", status=self.status_for(token), samples=collected))
             await asyncio.sleep(0.01)
 
@@ -213,12 +234,14 @@ async def commands(command: Command, request: Request):
     if service.controller != token:
         raise HTTPException(403, "请先取得控制权")
     if action in ("record_start", "record_stop"):
+        if action == "record_start" and service.status["connection"] != "OP":
+            raise HTTPException(409, "请先连接实机")
         try:
             (service.record_start if action == "record_start" else service.record_stop)()
         except (OSError, ValueError) as exc:
             raise HTTPException(409, str(exc)) from exc
         return dict(id=command.id, ok=True, result=service.status_for(token))
-    if action in ("connect", "disconnect", "simulate"):
+    if action in ("connect", "disconnect"):
         service.record_stop()
     answer = await worker_request(service, action, command.args, service.generation)
     answer["id"] = command.id
@@ -240,6 +263,7 @@ async def websocket(ws: WebSocket):
     await ws.accept()
     token = secrets.token_urlsafe(24)
     queue = service.clients[token] = asyncio.Queue(maxsize=2)
+    service.viewer_drops[token] = 0
 
     async def receive():
         while True:

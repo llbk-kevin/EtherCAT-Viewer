@@ -2,52 +2,80 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>EtherCAT Viewer</title>
   <link rel="stylesheet" href="/static/vendor/uPlot.min.css">
   <link rel="stylesheet" href="/static/style.css">
   <script defer src="/static/vendor/uPlot.iife.min.js"></script>
+  <script defer src="/static/charts.js"></script>
   <script defer src="/static/app.js"></script>
   <script defer src="/static/reference.js"></script>
 </head>
 <body>
   <header class="top">
-    <div class="brand"><i aria-hidden="true"></i><h1>EtherCAT Viewer</h1></div>
-    <div class="indicators"><strong id="mode">SIMULATION</strong><span id="connection">启动中</span></div>
+    <div class="brand"><span class="badge" aria-hidden="true"><i></i><i></i><i></i><i></i></span><h1>EtherCAT Viewer</h1></div>
+    <span id="connection" class="connection" role="status">掉线</span>
   </header>
   <main>
-    <section class="connection panel" aria-label="连接管理">
-      <div class="network">
+    <section class="toolbar" aria-label="连接与输出管理">
+      <div class="group">
         <label for="adapters">EtherCAT 接口</label>
-        <div class="group"><select id="adapters"><option value="">读取网卡中…</option></select><button id="refresh">刷新</button></div>
+        <select id="adapters"><option value="">读取网卡中…</option></select>
+        <button id="refresh">刷新</button>
+        <button id="claim">取得控制权</button>
+        <button class="primary" id="connect">连接实机</button>
+        <button id="disconnect">断开</button>
       </div>
       <div class="group">
-        <button id="claim">取得控制权</button>
-        <button id="connect" class="primary">连接实机</button>
-        <button id="disconnect">断开</button>
-        <button id="simulate">切换模拟</button>
+        <span id="lock">输出已锁定</span>
+        <button id="arm">解锁输出</button>
+        <button class="danger" id="zero">清零并锁定</button>
       </div>
     </section>
     <p id="message" role="status" hidden></p>
-    <div class="grid">
-      <section class="panel trace" aria-labelledby="trace-title">
-        <div class="panel-head"><div><h2 id="trace-title">模拟量输入</h2><p>电压 / V · 最近 30 秒</p></div>
-          <div class="group"><button id="record">开始记录</button><a id="export" href="/api/recording" hidden>下载 CSV</a></div>
+    <section class="scope" aria-labelledby="scope-title">
+      <div class="section-head">
+        <div><h2 id="scope-title">实时波形</h2><p>时间 / s · 电压 / V · 滚轮缩放 · 拖拽框选</p></div>
+        <div class="group">
+          <span id="time-window">30.0 s · 实时</span>
+          <button id="zoom-in" aria-label="缩短时间窗">− 时间窗</button>
+          <button id="zoom-out" aria-label="延长时间窗">+ 时间窗</button>
+          <button id="follow">回到实时</button>
         </div>
-        <div id="plot" aria-label="四路电压随时间变化的曲线"></div>
-        <div id="inputs" class="input-grid"></div>
-      </section>
-      <section class="panel output" aria-labelledby="output-title">
-        <div class="panel-head"><div><h2 id="output-title">模拟量输出</h2><p>AO1 / AO4 · −1 至 +1 V</p></div></div>
-        <div class="lock"><strong id="lock">输出已锁定</strong><p id="zero-state">等待数据</p></div>
-        <div class="group actions"><button id="arm" class="primary">解锁输出</button><button id="zero" class="danger">清零并锁定</button></div>
-        <div id="outputs"></div>
-      </section>
-    </div>
-    <section class="panel diagnostic" aria-labelledby="diag-title">
-      <div class="panel-head"><div><h2 id="diag-title">总线诊断</h2><p id="timing">通信周期目标 10 ms</p></div><div class="counter"><span id="wkc">WKC — / —</span><details><summary>WKC 是什么</summary><p>每轮通信的处理回执。这里显示实际值 / 预期值。3 / 3 表示本轮所需的读写都得到了确认。−1 表示本轮未收到过程数据回应。通信异常时，输出锁定，输入读数标为失效。</p></details></div></div>
-      <div class="table-wrap"><table><thead><tr><th>从站</th><th>厂商 / 产品</th><th>Revision</th><th>AL 状态</th><th>状态码</th></tr></thead><tbody id="devices"></tbody></table></div>
-      <details id="mapping" hidden><summary>PDO 映射与看门狗配置</summary><pre id="mapping-text"></pre></details>
+      </div>
+      <h3>模拟量输出 <span>已获通信回执的下发值</span></h3>
+      <div class="chart-grid" id="outputs"></div>
+      <h3>模拟量输入 <span>采集电压</span></h3>
+      <div class="chart-grid" id="inputs"></div>
+    </section>
+    <section class="diagnostic panel" aria-labelledby="diag-title">
+      <div class="section-head">
+        <div><h2 id="diag-title">通信诊断</h2><p id="bus-summary">等待实机连接</p></div>
+        <div class="group">
+          <button id="record">开始记录</button><a class="button" id="export" href="/api/recording" hidden>下载 CSV</a>
+        </div>
+      </div>
+      <dl class="metrics">
+        <div><dt>目标周期</dt><dd id="target-metric">10 ms</dd></div>
+        <div><dt>实际周期间隔</dt><dd id="interval-metric">—</dd></div>
+        <div><dt>主站收发耗时</dt><dd id="roundtrip-metric">—</dd></div>
+        <div><dt>实际更新率</dt><dd id="rate-metric">—</dd></div>
+        <div><dt>WKC 实际 / 预期</dt><dd id="wkc">—</dd></div>
+        <div><dt>通信异常</dt><dd id="error-metric">0</dd></div>
+        <div><dt>调度漏期</dt><dd id="missed-metric">0</dd></div>
+      </dl>
+      <div class="diagnostic-body">
+        <form id="period-form" class="group"><label for="period">通信周期</label>
+          <input id="period" type="number" min="1" max="50" step="1" value="10" required><span>ms</span><button>应用周期</button>
+        </form>
+        <p id="fault-detail" role="status"></p>
+        <details><summary>最近 10 秒统计与从站详情</summary>
+          <p>周期间隔是相邻两次交换的起始间隔，收发耗时是单次主站发送至接收返回的时间。WKC 是处理回执，3 / 3 表示本轮所需读写均获确认。−1 表示未收到回应。</p>
+          <div class="table-wrap"><table><thead><tr><th>指标</th><th>最新</th><th>中位数</th><th>P95</th><th>最大</th><th>样本</th></tr></thead><tbody id="timing-details"></tbody></table></div>
+          <p id="viewer-drops"></p>
+          <div class="table-wrap"><table><thead><tr><th>从站</th><th>厂商 / 产品</th><th>Revision</th><th>AL 状态</th><th>状态码</th></tr></thead><tbody id="devices"></tbody></table></div>
+          <p id="input-details"></p><pre id="mapping-text" hidden></pre>
+        </details>
       <details class="reference">
         <summary>万用表记录与校准参数</summary>
         <p>测量值与参数保存在当前浏览器。当前曲线和输出使用设备原始量程换算。</p>

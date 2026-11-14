@@ -1,226 +1,232 @@
 "use strict";
 const el = id => document.getElementById(id);
-const colors = ["#48d6c7", "#ffc374", "#a8a5ff", "#72b8ff"];
-const flagNames = {underrange:"欠量程", overrange:"超量程", error:"错误", sync_error:"同步错误",
-  invalid:"数据无效", limit1:"限值 1", limit2:"限值 2", toggle:"更新位", status:"状态字"};
-const connectionNames = {STARTING:"启动中", RUNNING:"模拟运行", OP:"OP", FAULT:"故障",
-  STALE:"数据超时", DISCONNECTED:"已断开", CONNECTING:"连接中"};
-const inputs = [];
-const outputs = [];
-for (let i = 0; i < 4; i++) {
-  const ch = i + 1;
-  const loop = ch === 1 || ch === 4;
-  const card = document.createElement("div");
-  card.className = "input";
-  card.innerHTML = '<div class="input-title">AI' + ch + '</div><div class="reading">—</div>' +
-    '<small>' + (loop ? '回环 AO' + ch : '接线记录：悬空') + '</small><small class="raw"></small><small class="flags"></small>';
-  card.firstElementChild.style.color = colors[i];
-  el("inputs").append(card);
-  inputs.push(card);
+const charts = new SharedCharts(el("time-window"));
+const channelCards = [];
+let socket, token, lastSample, sequence = 0, pending = false;
+let state = {}, lastFrame = 0, pendingPeriod = false;
 
-  const row = document.createElement("div");
-  row.className = "ao";
-  row.innerHTML = '<div class="ao-head"><strong>AO' + ch + '</strong><span>' +
-    (loop ? '→ AI' + ch : '固定零值') + '</span><output>指令 0.000 V</output></div>' +
-    (loop ? '<div class="group"><input id="value-' + ch + '" aria-label="AO' + ch +
-    ' 电压或振幅" type="number" min="-1" max="1" step="0.001" value="0">' +
-    '<button id="apply-' + ch + '">设定</button><button id="wave-' + ch + '">正弦 0.2 Hz</button></div>' : '');
-  el("outputs").append(row);
-  outputs.push(row);
-  if (loop) {
-    const value = el("value-" + ch);
-    for (const [id, action] of [["apply-", "set_output"], ["wave-", "wave"]]) {
-      el(id + ch).onclick = () => {
-        if (!value.checkValidity() || !Number.isFinite(value.valueAsNumber)) {
-          value.reportValidity();
-          showMessage("请输入 −1 至 +1 V 的电压或振幅", true);
-          return;
-        }
-        command(action, {channel:ch, voltage:value.valueAsNumber});
-      };
-    }
+function channelCard(channel, output) {
+  const name = (output ? "AO" : "AI") + channel;
+  const card = document.createElement("article");
+  card.className = "chart-card";
+  card.style.setProperty("--trace", traceColors[channel - 1]);
+  card.innerHTML = '<div class="chart-head"><strong>' + name + '</strong>' +
+    '<output class="reading" aria-label="' + name + ' 电压">—</output></div>' +
+    '<div class="plot" aria-label="' + name + ' 电压波形"></div>';
+  if (output) {
+    const form = document.createElement("form");
+    form.className = "generator";
+    form.innerHTML = '<div class="generator-form">' +
+      '<label>波形<select aria-label="' + name + ' 波形" id="shape-' + channel + '">' +
+      '<option value="dc">直流</option><option value="sine">正弦</option>' +
+      '<option value="triangle">三角</option><option value="square">方波</option></select></label>' +
+      '<label><span class="voltage-label">电压 / V</span><input aria-label="' + name + ' 电压或峰值" ' +
+      'id="voltage-' + channel + '" type="number" min="-10" max="10" step="any" required value="0"></label>' +
+      '<label>频率 / Hz<input aria-label="' + name + ' 频率" id="frequency-' + channel + '" ' +
+      'type="number" min="0.01" max="25" step="any" required value="0.2"></label></div>' +
+      '<p class="wave-info"></p><div class="group"><button class="apply">应用</button>' +
+      '<button class="stop" type="button">停波清零</button></div>';
+    const [shape, voltage, frequency] = form.querySelectorAll("select,input");
+    form.oninput = () => renderGenerator(form, canOutput());
+    form.onsubmit = event => {
+      event.preventDefault();
+      const value = voltage.valueAsNumber;
+      if (shape.value === "dc") command("set_output", {channel, voltage: value});
+      else command("wave", {channel, shape: shape.value, peak: value, frequency: frequency.valueAsNumber});
+    };
+    form.querySelector(".stop").onclick = () => command("stop_wave", {channel});
+    card.append(form);
+  }
+  el(output ? "outputs" : "inputs").append(card);
+  channelCards.push(card);
+  charts.attach(card.querySelector(".plot"), channelCards.length - 1);
+}
+
+for (const output of [true, false]) {
+  for (let channel = 1; channel <= 4; channel++) channelCard(channel, output);
+}
+el("zoom-in").onclick = () => charts.zoom(0.5);
+el("zoom-out").onclick = () => charts.zoom(2);
+el("follow").onclick = () => charts.follow();
+
+function canOutput() {
+  return token && state.controller && state.connection === "OP" && state.armed && !pending;
+}
+function text(id, value) {
+  const node = el(id);
+  if (node.textContent !== value) node.textContent = value;
+}
+function showMessage(message, error = false) {
+  text("message", message);
+  el("message").hidden = !message;
+  el("message").classList.toggle("error", error);
+}
+function format(value, digits = 3, unit = " ms") {
+  return Number.isFinite(value) ? value.toFixed(digits) + unit : "—";
+}
+function setRows(id, rows) {
+  const body = el(id);
+  const key = JSON.stringify(rows);
+  if (body.dataset.key === key) return;
+  body.dataset.key = key;
+  body.replaceChildren();
+  for (const row of rows) {
+    const tr = body.insertRow();
+    for (const value of row) tr.insertCell().textContent = value;
   }
 }
 
-let plot, socket, token, state = {}, last = null, history = [], origin, sequence = 0;
-let connected = false, pending = false, lastSocketFrame = 0;
-let mapDescription = "";
-const plotBox = el("plot");
-const plotOptions = {
-  width: Math.max(220, plotBox.clientWidth), height:295,
-  scales:{x:{time:false,range:(_u,min,max) => [Math.max(0,max-30), Math.max(30,max)]},
-    y:{range:(_u,min,max) => [Math.min(-1.1,min), Math.max(1.1,max)]}},
-  axes:[{label:"运行时间 / s",stroke:"#a5b5c3",grid:{stroke:"#2b3948"}},
-    {stroke:"#a5b5c3",size:54,grid:{stroke:"#2b3948"}}],
-  series:[{}, ...colors.map((stroke,i)=>({label:"AI"+(i+1),stroke,width:1.6,spanGaps:false,
-    value:(_u,v)=>v == null ? "—" : v.toFixed(3)+" V"}))],
-};
-plot = new uPlot(plotOptions, [[],[],[],[],[]], plotBox);
-new ResizeObserver(() => plot.setSize({width:Math.max(220,plotBox.clientWidth),height:295})).observe(plotBox);
+function renderGenerator(form, enabled) {
+  const [shape, voltage, frequency] = form.querySelectorAll("select,input");
+  const dc = shape.value === "dc";
+  const period = state.period_ms || 10;
+  const limit = Math.min(100, 250 / period);
+  voltage.min = dc ? "-10" : "0";
+  frequency.max = String(limit);
+  form.querySelector(".voltage-label").textContent = dc ? "电压 / V" : "峰值 / V";
+  shape.disabled = voltage.disabled = form.querySelector(".apply").disabled = form.querySelector(".stop").disabled = !enabled;
+  frequency.disabled = !enabled || dc;
+  const points = 1000 / period / frequency.valueAsNumber;
+  const info = form.querySelector(".wave-info");
+  info.classList.toggle("warning", !dc && points < 20);
+  info.textContent = dc ? "−10 至 +10 V" : "约 " +
+    (Number.isFinite(points) && points > 0 ? points.toFixed(1) : "—") +
+    " 点 / 波形周期" + (points < 20 ? " · 台阶明显" : "");
+}
 
-function showMessage(text, error=false) {
-  const box = el("message");
-  box.textContent = text;
-  box.hidden = !text;
-  box.className = error ? "error" : "";
+function renderDiagnostics(online) {
+  const stats = state.timing || {};
+  const period = state.period_ms || 10;
+  text("target-metric", period + " ms");
+  text("interval-metric", online ? format(stats.interval?.latest) : "—");
+  text("roundtrip-metric", online ? format(stats.roundtrip?.latest) : "—");
+  text("rate-metric", online ? format(stats.update_hz, 1, " Hz") : "—");
+  text("wkc", online ? (state.wkc ?? "—") + " / " + (state.expected_wkc ?? "—") : "—");
+  text("error-metric", String(state.errors ?? 0));
+  text("missed-metric", String(state.missed ?? 0));
+  text("bus-summary", online ? (state.devices?.length ?? 0) + " 个从站处于 OP · 看门狗 " + state.watchdog_ms + " ms" : "等待实机连接");
+  const lastWkc = !online && state.wkc != null ? " · 最后 WKC " + state.wkc + "/" + state.expected_wkc : "";
+  const lastError = state.last_error && state.last_error !== state.reason ? "上次异常 " + state.last_error : "";
+  text("fault-detail", [...new Set([state.reason, state.zero, lastError].filter(Boolean))].join(" · ") + lastWkc);
+  setRows("timing-details", [["实际周期间隔", stats.interval], ["主站收发耗时", stats.roundtrip]]
+    .map(([name, series]) => [name, ...["latest", "median", "p95", "max"].map(key => format(series?.[key])), series?.count ?? 0]));
+  text("viewer-drops", "工作进程遥测遗漏 " + (state.dropped ?? 0) + " · 本页推送遗漏 " + (state.viewer_drops ?? 0));
+  setRows("devices", (state.devices || []).map(d => [d.name, d.vendor + " / " + d.product, d.revision, d.state, d.al_status]));
+  if (el("input-details").parentElement.open) text("input-details", online && lastSample ? lastSample.raw.map((v, i) =>
+    "AI" + (i + 1) + " " + (v ?? "—") + " · " + (JSON.stringify(lastSample.flags[i]) ?? "—")).join(" | ") : "输入状态未提供");
+  const mapping = el("mapping-text");
+  mapping.hidden = !Object.keys(state.mapping || {}).length;
+  if (!mapping.hidden && mapping.parentElement.open) text("mapping-text", JSON.stringify(state.mapping, null, 2));
 }
 
 function render() {
-  const active = connected && state.controller;
-  const busyBus = ["OP", "CONNECTING"].includes(state.connection);
-  const validSamples = connected && ["OP","RUNNING"].includes(state.connection);
-  el("mode").textContent = state.mode || "SIMULATION";
-  el("mode").classList.toggle("live", state.mode === "LIVE");
-  el("connection").textContent = connected ? (connectionNames[state.connection] || state.connection) : "网页连接中断";
-  el("connection").classList.toggle("fault", !validSamples);
-  el("claim").textContent = active ? "本页控制中" : state.controller_busy ? "另一页面控制中" : "取得控制权";
-  el("claim").disabled = !connected || state.controller_busy || pending;
-  el("connect").disabled = !active || busyBus || !el("adapters").value || pending;
-  el("disconnect").disabled = !active || state.mode !== "LIVE" || state.connection === "DISCONNECTED" || pending;
-  el("simulate").disabled = !active || state.mode === "SIMULATION" || pending;
-  el("refresh").disabled = !connected || busyBus || pending;
-  el("arm").disabled = !active || !state.ready || state.armed || !validSamples || pending;
-  el("zero").disabled = !active || !validSamples || pending;
-  el("record").disabled = !active || (!validSamples && !state.recording) || pending;
-  el("record").textContent = state.recording ? "停止记录" : "开始记录";
+  const online = token && state.connection === "OP";
+  const controller = token && state.controller;
+  text("connection", online ? "已连接 · OP" : pending && state.connection === "CONNECTING" ? "连接中" : "掉线");
+  el("connection").classList.toggle("online", Boolean(online));
+  text("claim", controller ? "本页控制中" : state.controller_busy ? "另一页面控制中" : "取得控制权");
+  el("claim").disabled = !token || state.controller_busy || pending;
+  el("connect").disabled = !controller || online || !el("adapters").value || pending;
+  el("disconnect").disabled = !controller || !online || pending;
+  el("refresh").disabled = !token || online || pending;
+  el("arm").disabled = !controller || !online || !state.ready || state.armed || pending;
+  el("zero").disabled = !controller || !online || pending;
+  text("lock", online && state.armed ? "输出已解锁" : "输出已锁定");
+  el("record").disabled = !controller || (!online && !state.recording) || pending;
+  text("record", state.recording ? "停止记录" : "开始记录");
   el("export").hidden = !state.export;
-  el("lock").textContent = connected && state.armed ? "输出已解锁" : "输出已锁定";
-  el("zero-state").textContent = connected ? ([state.reason, state.zero].filter(Boolean).join(" · ") || "等待数据") : "输出状态未知";
-  el("wkc").textContent = "WKC " + (state.wkc ?? "—") + " / " + (state.expected_wkc ?? "—");
-  el("timing").textContent = "目标周期 10 ms" +
-    (state.watchdog_ms ? " · 看门狗 " + state.watchdog_ms + " ms" : "") +
-    (state.max_interval_ms ? " · 最长 " + state.max_interval_ms.toFixed(2) + " ms" : "") +
-    " · WKC/状态异常 " + (state.errors ?? 0) + " · 遗漏采样 " + (state.dropped ?? 0);
-  for (let i = 0; i < 4; i++) {
-    const valid = validSamples && last?.valid[i];
-    const raw = validSamples ? last?.raw[i] : null;
-    inputs[i].querySelector(".reading").textContent = valid ? last.ai[i].toFixed(3) + " V" : "—";
-    inputs[i].querySelector(".raw").textContent = "原始值 " + (raw ?? "—");
-    const flags = validSamples ? last?.flags[i] : null;
-    inputs[i].querySelector(".flags").textContent = flags ? Object.entries(flags)
-      .map(([k,v]) => (flagNames[k] || k) + " " + v).join(" · ") : "状态未提供";
-    outputs[i].querySelector("output").textContent = validSamples ?
-      "指令 " + (state.ao?.[i] ?? 0).toFixed(3) + " V" : "指令 —";
-    const waveform = outputs[i].querySelector('[id^="wave-"]');
-    if (waveform) waveform.textContent = state.wave?.includes(i) ? "重启正弦" : "正弦 0.2 Hz";
-    for (const field of outputs[i].querySelectorAll("input, button")) {
-      field.disabled = !active || !state.armed || !validSamples || pending;
-    }
-  }
-  const rows = (state.devices || []).map(d => [d.name, d.vendor+" / "+d.product, d.revision, d.state, d.al_status]);
-  const body = el("devices");
-  const tableKey = JSON.stringify(rows);
-  if (body.dataset.key !== tableKey) {
-    body.dataset.key = tableKey;
-    body.replaceChildren();
-    for (const row of rows.length ? rows : [["—","—","—","—","—"]]) {
-      const tr = body.insertRow();
-      for (const value of row) tr.insertCell().textContent = value;
-    }
-  }
-  updateMapping();
-}
-
-function updateMapping() {
-  const data = JSON.stringify(state.mapping || {}, null, 2);
-  el("mapping").hidden = data === "{}";
-  if (data !== mapDescription) {
-    mapDescription = data;
-    el("mapping-text").textContent = data;
-  }
+  el("period-form").querySelector("button").disabled = !controller || pending;
+  if (!pendingPeriod && document.activeElement !== el("period")) el("period").value = state.period_ms || 10;
+  const samples = online && lastSample?.session === state.session ? lastSample : null;
+  channelCards.forEach((card, index) => {
+    const value = index < 4 ? samples?.ao[index] : samples?.ai[index - 4];
+    card.querySelector(".reading").textContent = format(value, 3, " V");
+    if (index < 4) renderGenerator(card.querySelector(".generator"), canOutput());
+  });
+  renderDiagnostics(online);
 }
 
 async function refresh() {
-  const select = el("adapters");
   try {
     const response = await fetch("/api/adapters");
     const data = await response.json();
     if (!response.ok) throw Error(data.detail);
-    select.replaceChildren();
     const target = data.items.find(item => item.target);
-    if (target) {
-      const label = target.name + " · " + target.speed + (target.status === "Up" ? "" : " · 未连接");
-      select.add(new Option(label, target.status === "Up" ? target.interface || "" : ""));
-    } else select.add(new Option("未发现 EtherCAT 网卡", ""));
+    el("adapters").replaceChildren(new Option(target ? target.name + " · " + target.speed : "未发现 EtherCAT 网卡",
+      target?.status === "Up" ? target.interface || "" : ""));
     if (data.error) showMessage(data.error, true);
   } catch (error) { showMessage(error.message, true); }
   render();
 }
 
-async function command(action, args={}) {
+async function command(action, args = {}) {
   if (!token || pending) return;
   pending = true;
   render();
   try {
-    const response = await fetch("/api/commands", {method:"POST",
-      headers:{"content-type":"application/json","x-viewer-session":token},
-      body:JSON.stringify({id:String(++sequence), action, args})});
+    const response = await fetch("/api/commands", {method: "POST",
+      headers: {"content-type": "application/json", "x-viewer-session": token},
+      body: JSON.stringify({id: String(++sequence), action, args})});
     const data = await response.json();
     if (!response.ok || !data.ok) throw Error(data.error || data.detail || "命令失败");
-    if (data.result) state = {...state,...data.result};
-    showMessage(action === "zero" ? "清零指令已处理，输出已锁定" : "");
-  } catch (error) { showMessage(String(error.message), true); }
+    if (data.result) state = {...state, ...data.result};
+    if (action === "set_period") {
+      pendingPeriod = false;
+      el("period").value = state.period_ms;
+    }
+    showMessage(action === "zero" ? "已清零并锁定输出" : "");
+  } catch (error) { showMessage(error.message, true); }
   finally { pending = false; render(); }
 }
 
 el("refresh").onclick = refresh;
-el("adapters").onchange = render;
 el("claim").onclick = () => command("claim");
-el("connect").onclick = () => command("connect",{interface:el("adapters").value});
-for (const action of ["disconnect","simulate","arm","zero"]) el(action).onclick = () => command(action);
+el("connect").onclick = () => command("connect", {interface: el("adapters").value});
+for (const action of ["disconnect", "arm", "zero"]) el(action).onclick = () => command(action);
 el("record").onclick = () => command(state.recording ? "record_stop" : "record_start");
+el("period").oninput = () => { pendingPeriod = true; };
+el("period-form").onsubmit = event => {
+  event.preventDefault();
+  command("set_period", {period_ms: el("period").valueAsNumber});
+};
 
 function connectWebSocket() {
   socket = new WebSocket("ws://" + location.host + "/ws");
   socket.onmessage = event => {
-    lastSocketFrame = performance.now();
+    lastFrame = performance.now();
     const packet = JSON.parse(event.data);
-    if (packet.kind === "hello") token = packet.token;
-    connected = true;
-    const modeChanged = state.mode !== packet.status.mode;
-    if (modeChanged || packet.kind === "hello") {
-      history = [];
-      last = origin = null;
+    if (packet.kind === "hello") {
+      token = packet.token;
+      // A service restart breaks the timestamp epoch and sample sequence.
+      if (charts.rows.length && (!packet.samples.length ||
+          packet.samples.at(-1).seq < charts.rows.at(-1).seq)) {
+        charts.rows = [];
+        charts.start = 0;
+        charts.origin = null;
+        lastSample = null;
+        charts.follow();
+      }
+      if (!el("adapters").value) refresh();
     }
     state = packet.status;
-    const data = packet.samples || [];
-    if (data.length) {
-      origin ??= data[0].time_ns;
-      history.push(...data);
-      last = data.at(-1);
-      history = history.filter(sample => last.time_ns-sample.time_ns <= 30e9);
-      const x = [];
-      const y = [[],[],[],[]];
-      let previous = null;
-      for (const sample of history) {
-        if (previous && sample.seq !== previous.seq + 1) {
-          x.push((previous.time_ns + (sample.time_ns-previous.time_ns)/2-origin)/1e9);
-          for (const values of y) values.push(null);
-        }
-        x.push((sample.time_ns-origin)/1e9);
-        for (let i=0;i<4;i++) y[i].push(sample.ai[i]);
-        previous = sample;
-      }
-      plot.setData([x,...y]);
+    if (packet.samples.length) {
+      lastSample = packet.samples.at(-1);
+      charts.append(packet.samples);
     }
-    if (packet.kind === "hello" && !el("adapters").value && state.connection !== "OP") refresh();
     render();
   };
   socket.onclose = () => {
-    connected = false;
     token = null;
+    state = {...state, connection: "DISCONNECTED", reason: "网页与本地服务的连接已中断"};
     render();
     setTimeout(connectWebSocket, 1000);
   };
 }
 setInterval(() => {
   if (socket?.readyState === WebSocket.OPEN) {
-    if (connected && performance.now()-lastSocketFrame > 3000) {
-      socket.close();
-    } else if (state.controller) {
-      socket.send("heartbeat");
-    }
+    if (token && performance.now() - lastFrame > 3000) socket.close();
+    else if (state.controller) socket.send("heartbeat");
   }
-},500);
+}, 500);
 render();
 connectWebSocket();

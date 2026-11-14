@@ -47,8 +47,8 @@ def raw_voltage(value):
     return round(value * (32768 if value < 0 else 32767) / 10)
 
 def validated_voltage(value):
-    if type(value) not in (int, float) or not -1 <= value <= 1 or not math.isfinite(value):
-        raise ValueError("电压必须为 −1 至 +1 V 的有限数值")
+    if type(value) not in (int, float) or not -10 <= value <= 10 or not math.isfinite(value):
+        raise ValueError("电压必须为 −10 至 +10 V 的有限数值")
     return float(value)
 
 class Mapping:
