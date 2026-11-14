@@ -25,11 +25,11 @@ cd EtherCAT-Viewer
 
 ## 四、文档
 
-1. [Windows 安装与首次启动](docs/01-windows-setup.md)
-2. [实机接线与仪表盘操作](docs/02-hardware-and-operation.md)
-3. [系统架构与实现细节](docs/03-architecture.md)
-4. [通信诊断与故障排查](docs/04-troubleshooting.md)
-5. [现场现状与验收记录](docs/05-hardware-acceptance.md)
-6. [开发、打包与发布](docs/06-build-and-release.md)
+1. [Windows 安装与首次启动](docs/01-安装与首次启动.md)
+2. [实机接线与仪表盘操作](docs/02-实机接线与仪表盘操作.md)
+3. [系统架构与实现细节](docs/03-系统架构与实现细节.md)
+4. [通信诊断与故障排查](docs/04-通信诊断与故障排查.md)
+5. [现场现状与验收记录](docs/05-现场现状与验收记录.md)
+6. [开发、打包与发布](docs/06-开发、打包与发布.md)
 
 第三方依赖的许可与对应源码见 [第三方组件与许可](THIRD-PARTY-NOTICES.md)。
