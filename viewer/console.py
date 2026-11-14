@@ -2,10 +2,11 @@ import ctypes
 from datetime import datetime
 import json
 import os
-from pathlib import Path
 from threading import Event
 
-LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "backend-shutdown.jsonl"
+from .paths import data_root
+
+LOG_PATH = data_root() / "logs" / "backend-shutdown.jsonl"
 CLOSE_WAIT_SECONDS = 4
 CTRL_C_EVENT = 0
 CTRL_CLOSE_EVENT = 2
@@ -14,7 +15,7 @@ CTRL_CLOSE_EVENT = 2
 def log_stop(event, **fields):
     record = dict(time=datetime.now().astimezone().isoformat(timespec="milliseconds"),
                   event=event, pid=os.getpid(), **fields)
-    LOG_PATH.parent.mkdir(exist_ok=True)
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     data = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
     with LOG_PATH.open("ab", buffering=0) as stream:
         stream.write(data)

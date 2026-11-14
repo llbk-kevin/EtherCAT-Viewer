@@ -1,5 +1,6 @@
 import asyncio
 from importlib.metadata import PackageNotFoundError, version
+import multiprocessing
 import os
 from pathlib import Path
 import socket
@@ -75,11 +76,18 @@ def main():
     def close_timeout():
         log_stop("console_close_timeout", reason=reason, zero="unknown")
 
+    frozen = getattr(sys, "frozen", False)
+    if frozen:
+        for stream in (sys.stdout, sys.stderr):
+            if stream is not None:
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+
     with ConsoleStop(request_stop, close_timeout, title="EtherCAT Viewer 后端"):
-        requirements = Path(__file__).resolve().parent / "requirements.txt"
-        if not meets_requirements(requirements):
-            subprocess.run([sys.executable, "-m", "pip", "install", "--only-binary=:all:",
-                            "-r", str(requirements)], check=True)
+        if not frozen:
+            requirements = Path(__file__).resolve().parent / "requirements.txt"
+            if not meets_requirements(requirements):
+                subprocess.run([sys.executable, "-m", "pip", "install", "--only-binary=:all:",
+                                "-r", str(requirements)], check=True)
         if requested.is_set():
             return 0
 
@@ -108,4 +116,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main())

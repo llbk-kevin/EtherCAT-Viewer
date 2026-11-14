@@ -8,3 +8,7 @@ __pycache__/
 logs/
 recordings/
 .tooling/
+
+# Windows 单文件构建目录和发布文件
+/build/
+/dist/

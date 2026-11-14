@@ -1,0 +1,44 @@
+# 一、Windows 安装与首次启动
+
+## 一、准备条件
+
+| 条件 | 从源码运行 | 运行单文件 EXE |
+| --- | --- | --- |
+| Windows 与浏览器 | Windows 10/11 x64、Edge 或兼容现代浏览器 | 同左 |
+| Git for Windows | 用于克隆和更新 | 无需安装 |
+| Python 3.12 x64 | 建议安装器中勾选 Add Python to PATH | EXE 内置 |
+| 网络 | 首次克隆及安装 wheel 需要网络 | 下载后可在本机离线启动 |
+| Npcap | 连接 EtherCAT 实机所需 | 连接 EtherCAT 实机所需 |
+
+源码可用 `python -c "import struct, sys; print(sys.version, struct.calcsize('P') * 8)"` 确认显示 Python 3.12 和 64 位。应用通过 PySOEM wheel 使用 SOEM，使用者无需自行编译 SOEM。
+
+## 二、克隆或下载
+
+源码在 PowerShell 中执行以下命令。访问受限副本时，确保 GitHub 账号具有仓库权限，HTTPS 克隆时按 Git Credential Manager 提示登录。
+
+```powershell
+git clone https://github.com/llbk-kevin/EtherCAT-Viewer.git
+cd EtherCAT-Viewer
+```
+
+从 Release 下载 EXE 时，可同时下载同名 `.exe.sha256`。打开文件核对哈希与 `Get-FileHash -Algorithm SHA256 -LiteralPath <EXE路径>` 的输出。将 EXE 存放在有执行权限的目录。
+
+## 三、安装 Npcap
+
+从 [Npcap 官网](https://npcap.com/#download) 获取安装程序，使用有权限的账户安装，勾选 **Install Npcap in WinPcap API-compatible Mode**。如果额外启用了仅管理员可用选项，启动后端时也需要相应权限。安装后启动或重启 Viewer，再刷新接口列表。
+
+## 四、首次启动与连接
+
+1. 源码目录双击 `start-viewer.cmd`，或执行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start.ps1`。首次启动创建 `.venv`，按 `requirements.txt` 安装 wheel。
+2. 使用 EXE 时直接双击。控制台显示「服务已就绪」后会用默认浏览器打开 [仪表盘](http://127.0.0.1:8765/)；也可以手动输入该地址。
+3. 用指定的有线网卡直连 EK1100 X1，确认网卡状态已连接并显示速率。在网页选中该网卡，取得控制权，再点「连接实机」。
+4. 确认 OP、WKC `3/3` 和输出锁定后，按 [实机接线与仪表盘操作](02-hardware-and-operation.md) 做第一次回环。等待连接时页面显示掉线。
+
+## 五、日志与安装故障
+
+| 数据 | 源码运行位置 | EXE 运行位置 |
+| --- | --- | --- |
+| 退出日志 | 项目 `logs/backend-shutdown.jsonl` | `%LOCALAPPDATA%\EtherCAT-Viewer\logs\backend-shutdown.jsonl` |
+| CSV 录制 | 项目 `recordings\` | `%LOCALAPPDATA%\EtherCAT-Viewer\recordings\` |
+
+若找不到 `python.exe`，检查 PATH 后重开终端。若首次安装 wheel 失败，检查网络、代理和 Python 架构。端口 8765 被占用时，先回到原后端控制台正常关闭服务。页面可开但接口不可选时，依次检查 EK1100 电源、网线、网卡状态和 Npcap 安装。详细步骤见 [通信诊断与故障排查](04-troubleshooting.md)。

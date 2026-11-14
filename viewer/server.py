@@ -19,10 +19,10 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .console import BusConsole, console_message, log_stop
 from .generator import DEFAULT_PERIOD_MS
+from .paths import data_root
 from .timing import TimingWindow
 from .worker import run_worker
 
-ROOT = Path(__file__).resolve().parent.parent
 STATIC = Path(__file__).resolve().parent / "static"
 
 class Command(BaseModel):
@@ -81,8 +81,8 @@ class Service:
     def record_start(self):
         if self.recording:
             raise ValueError("正在记录")
-        folder = ROOT / "recordings"
-        folder.mkdir(exist_ok=True)
+        folder = data_root() / "recordings"
+        folder.mkdir(parents=True, exist_ok=True)
         name = f"{self.status['mode'].lower()}-{datetime.now():%Y%m%d-%H%M%S-%f}.csv"
         target = folder / name
         self.record_error = None

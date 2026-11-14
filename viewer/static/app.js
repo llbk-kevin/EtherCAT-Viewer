@@ -129,6 +129,7 @@ function render() {
   el("connect").disabled = !controller || online || !el("adapters").value || pending;
   el("disconnect").disabled = !controller || !online || pending;
   el("refresh").disabled = !token || online || pending;
+  el("adapters").disabled = !token || online || pending;
   el("arm").disabled = !controller || !online || !state.ready || state.armed || pending;
   el("zero").disabled = !controller || !online || pending;
   text("lock", online && state.armed ? "输出已解锁" : "输出已锁定");
@@ -151,9 +152,16 @@ async function refresh() {
     const response = await fetch("/api/adapters");
     const data = await response.json();
     if (!response.ok) throw Error(data.detail);
-    const target = data.items.find(item => item.target);
-    el("adapters").replaceChildren(new Option(target ? target.name + " · " + target.speed : "未发现 EtherCAT 网卡",
-      target?.status === "Up" ? target.interface || "" : ""));
+    const select = el("adapters");
+    const previous = select.value;
+    select.replaceChildren(new Option(data.items.length ? "请选择有线网卡" : "未发现物理有线网卡", ""));
+    for (const item of data.items) {
+      const option = new Option([item.name, item.status === "Up" ? "已连接" : "链路未连接",
+        item.speed, item.interface ? "" : "Npcap 不可用"].filter(Boolean).join(" · "), item.interface || "");
+      option.disabled = item.status !== "Up" || !item.interface;
+      select.add(option);
+      if (!option.disabled && option.value === previous) option.selected = true;
+    }
     if (data.error) showMessage(data.error, true);
   } catch (error) { showMessage(error.message, true); }
   render();
@@ -180,6 +188,7 @@ async function command(action, args = {}) {
 }
 
 el("refresh").onclick = refresh;
+el("adapters").onchange = render;
 el("claim").onclick = () => command("claim");
 el("connect").onclick = () => command("connect", {interface: el("adapters").value});
 for (const action of ["disconnect", "arm", "zero"]) el(action).onclick = () => command(action);

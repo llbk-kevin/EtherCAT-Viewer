@@ -1,35 +1,35 @@
 # EtherCAT Viewer
 
-Windows 10/11 x64 本地仪表盘。支持 Beckhoff EK1100 → EL3104 → EL4134。现场验证接线为 AO1 → AI1、AO2 → AI3、AO4 → AI4，均为双线回环。EL9011 是末端盖。
+在 Windows 上连接 Beckhoff EK1100、EL3104 和 EL4134，显示四路模拟量输入、四路输出、波形发生器与通信诊断。仪表盘运行在本机浏览器中。
 
-双击项目目录中的 `start-viewer.cmd`，在 **EtherCAT Viewer 后端** 窗口查看启动和状态变化日志。服务就绪后会用系统默认浏览器打开 [EtherCAT Viewer](http://127.0.0.1:8765/)，然后可在网页手动连接实机。若浏览器未打开，可手动访问窗口中的地址。也可以在现有 PowerShell 窗口运行：
+![EtherCAT Viewer 仪表盘，显示四路输出、四路输入和通信诊断](docs/images/dashboard.png)
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
-```
+*实机演示。AO4 输出正弦波，AI3 显示交叉回环的采集结果。*
 
-首次启动要求 Python 3.12 x64。实机通信需要 [Npcap](https://npcap.com/#download)，安装时选择 WinPcap API-compatible Mode。启动后显示「掉线」。点击「取得控制权」，确认「以太网 3」，再点「连接实机」。网卡更换后，在 `viewer/hardware.py` 更新现场 GUID。启动和重连始终从零值锁定状态开始。
+## 一、下载 EXE 启动
 
-八个图框共用时间窗，上排是四路已获回执的 AO 下发值，下排是四路 AI 采集值。用滚轮或拖拽框选查看历史，点击「回到实时」恢复最近 30 秒的滚动。实时读数旁的电压与图中纵轴均使用 V，时间轴使用 s。
+从 [GitHub Releases](https://github.com/llbk-kevin/EtherCAT-Viewer/releases/latest) 下载 Windows x64 单文件 EXE。双击运行，控制台提示服务就绪后自动打开 [仪表盘](http://127.0.0.1:8765/)。运行 EXE 无需安装 Git 或 Python。连接实机要先安装 [Npcap](https://npcap.com/#download)，勾选 **Install Npcap in WinPcap API-compatible Mode**。
 
-点击「解锁输出」后，四路均支持 −10 至 +10 V 的直流以及正弦、三角、方波。周期波形填写峰值和频率，方波占空比为 50%。单通道「停波清零」只影响该路。换线前用「清零并锁定」，接好后重新解锁。输出的物理电压可用万用表独立核对。关闭控制页或通信故障时撤销输出，重连需重新解锁。
+## 二、从源码启动
 
-「通信诊断」支持 1–50 ms 的整数目标周期，默认 10 ms。在线切换保留波形相位和直流值。如果任一运行中的波形超出新周期允许的频率，旧设置继续生效。频率下限 0.01 Hz，上限为 100 Hz 和目标更新率的四分之一中的较小值；每个波形周期少于 20 个输出更新点时，曲线可能出现可见台阶。
-
-万用表参考值、增益和偏移保存在当前浏览器。曲线与输出使用设备原始量程换算。停止服务时，在后端窗口按 **Ctrl+C** 或点击右上角 **×**。服务会停止波形并尝试清零、断开 EtherCAT。关窗后可在 `logs/backend-shutdown.jsonl` 查看退出结果，其中 `confirmed` 表示零值已获 WKC 确认，`unknown` 表示未能确认，`not_connected` 表示停止时未连接总线。Windows 限制关闭窗口的清理时间，通信中断时由端子的 100 ms 看门狗保护。
-
-连接、WKC、状态码和 PDO 表在「通信诊断」中。周期间隔是相邻两次 PDO 交换起始的间隔，主站收发耗时是单轮发送到接收返回的用时。两项各显示近 10 秒统计。调度漏期、WKC 异常和网页推送遗漏各自统计。WKC（Working Counter，工作计数器）是每轮数据交换的处理回执。页面以实际值 / 预期值显示，例如 3 / 3 表示这一轮读写都得到了确认。连接失败时先确认 100 Mbps 链路、Npcap 兼容模式和选中的接口，再看具体 CoE、PDO 或 AL 状态错误。如果适配器打开失败且 Npcap 限制管理员访问，从管理员 PowerShell 运行启动命令。真实连接由独立通信进程独占，运行零输出诊断时先断开网页实机连接。
+安装 [Git for Windows](https://git-scm.com/download/win) 和 [Python 3.12 x64](https://www.python.org/downloads/windows/)，确保 `python.exe` 在 PATH 中。如需访问受限仓库，用已获权限的 GitHub 账号完成 Git Credential Manager 登录。克隆后双击 `start-viewer.cmd`，首次启动会安装 Python 依赖。
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m viewer.soak
-.\.venv\Scripts\python.exe -m pip install pytest
-.\.venv\Scripts\python.exe -m pytest -q
+git clone https://github.com/llbk-kevin/EtherCAT-Viewer.git
+cd EtherCAT-Viewer
 ```
 
-`viewer.soak` 默认运行 180 秒零输出通信，保存从站、PDO 映射、看门狗及周期统计到 `logs/zero-soak.json`。网页记录保存到 `recordings/`，停录后可下载 CSV。AI 电压由终端回读计算；WKC 确认的是过程数据交换。使用万用表独立核对实际 AO 电压和断线后的电压。
+## 三、连接 EtherCAT 实机
 
-后台固定 PySOEM 1.1.13 / SOEM 1.4 分支快照。PDO 使用 CoE 实际分配和缓冲区尺寸校验。EL4134 使用默认有符号表示、默认缩放和零看门狗替代值。实机连接时启用并回读 SM2 看门狗触发位，超时目标 100 ms。周期是 Windows 主站的调度目标。以实际周期分布判断表现，实机验收记录包含 1 ms 档的回执超时结果。uPlot 1.6.32 随程序本地提供，版权声明位于对应的 vendor 目录。
+用专用有线网卡直连已供电的 EK1100 **X1**，确认终端排列为 **EK1100 → EL3104 → EL4134 → EL9011**。在网页选择该网卡，点「取得控制权」和「连接实机」。首次连接保持输出锁定，确认状态为 OP、WKC 为 `3/3` 后再做回环实验。停止前从网页清零并断开，随后在后端控制台按 **Ctrl+C**。
 
-[方案审核与现场基线](docs/review.md)
+## 四、文档
 
-测量 EL4134 时，万用表置直流电压档。AO1 红笔接上半部左列「01」（物理端子 1），黑笔接下方同列「GND」（端子 2）。AO4 红笔接下半部右列「04」（端子 7），黑笔接下方同列「GND」（端子 8）。见 [Beckhoff 接线和 LED 资料](https://infosys.beckhoff.com/content/1033/el41xx/13207030411.html)。
+1. [Windows 安装与首次启动](docs/01-windows-setup.md)
+2. [实机接线与仪表盘操作](docs/02-hardware-and-operation.md)
+3. [系统架构与实现细节](docs/03-architecture.md)
+4. [通信诊断与故障排查](docs/04-troubleshooting.md)
+5. [现场现状与验收记录](docs/05-hardware-acceptance.md)
+6. [开发、打包与发布](docs/06-build-and-release.md)
+
+第三方依赖的许可与对应源码见 [第三方组件与许可](THIRD-PARTY-NOTICES.md)。

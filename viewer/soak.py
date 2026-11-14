@@ -1,21 +1,24 @@
 import argparse
 import json
-from pathlib import Path
 import statistics
 import time
 
-from .hardware import Hardware, adapters
+from .hardware import Hardware, adapter_guid
+from .paths import data_root
 
 def main():
-    parser = argparse.ArgumentParser(description="EtherCAT zero-output soak test")
+    parser = argparse.ArgumentParser(description="EtherCAT 零输出长测")
+    parser.add_argument("--adapter-guid", required=True, help="所选物理有线网卡的 InterfaceGuid")
     parser.add_argument("--seconds", type=int, default=180)
-    duration = parser.parse_args().seconds
+    args = parser.parse_args()
+    duration = args.seconds
     if duration < 1:
-        parser.error("--seconds must be positive")
-    target = next(row for row in adapters()["items"] if row["target"])
-    if not target["interface"]:
-        raise RuntimeError("Npcap 未枚举「以太网 3」")
-    bus = Hardware(target["interface"])
+        parser.error("--seconds 必须为正整数")
+    try:
+        guid = adapter_guid(args.adapter_guid)
+    except ValueError as exc:
+        parser.error(str(exc))
+    bus = Hardware(fr"\Device\NPF_{{{guid}}}")
     intervals, roundtrips = [], []
     report = {"target_period_ms": 10, "duration_s": duration, "cycles": 0, "wkc_errors": 0}
     try:
@@ -49,7 +52,7 @@ def main():
             if len(series) > 1:
                 report[key] = dict(min=min(series), median=statistics.median(series),
                                    p95=statistics.quantiles(series, n=100)[94], max=max(series))
-        folder = Path(__file__).resolve().parent.parent / "logs"
+        folder = data_root() / "logs"
         folder.mkdir(exist_ok=True)
         (folder / "zero-soak.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps({k: v for k, v in report.items() if k != "mapping"}, ensure_ascii=False), flush=True)

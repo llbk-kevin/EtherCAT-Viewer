@@ -1,13 +1,13 @@
 import ctypes
 import json
-import os
 import re
 import subprocess
 import time
+from uuid import UUID
 
+from .paths import powershell_path
 from .pdo import Mapping, read_int, read_mapping
 
-GUID = "9E210308-47E1-4EA0-AAB8-42FB54A8A7AC"
 EXPECTED = [(0x044C2C52, "EK1100"), (0x0C203052, "EL3104"), (0x10263052, "EL4134")]
 INIT, PREOP, SAFEOP, OP = 1, 2, 4, 8
 
@@ -18,20 +18,25 @@ def load_driver():
         raise RuntimeError("无法加载 PySOEM。请安装 Npcap 并启用 WinPcap API 兼容模式。") from exc
     return pysoem
 
+def adapter_guid(value):
+    try:
+        return str(UUID(value)).upper()
+    except (AttributeError, ValueError, TypeError) as exc:
+        raise ValueError("网卡 GUID 格式无效") from exc
+
+
 def adapters():
     command = (
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
-        "Get-NetAdapter -Physical | Select-Object Name,InterfaceGuid,Status,LinkSpeed,"
-        "InterfaceDescription | ConvertTo-Json -Compress"
+        "Get-NetAdapter -Physical | Where-Object InterfaceType -eq 6 | "
+        "Select-Object Name,InterfaceGuid,Status,LinkSpeed,InterfaceDescription | ConvertTo-Json -Compress"
     )
-    system = os.environ.get("SystemRoot", r"C:\Windows")
     result = subprocess.run(
-        [os.path.join(system, r"System32\WindowsPowerShell\v1.0\powershell.exe"),
-         "-NoProfile", "-NonInteractive", "-Command", command],
+        [powershell_path(), "-NoProfile", "-NonInteractive", "-Command", command],
         check=True, capture_output=True, encoding="utf-8-sig", timeout=5,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
-    rows = json.loads(result.stdout or "[]")
+    rows = json.loads(result.stdout or "[]") or []
     rows = rows if isinstance(rows, list) else [rows]
     try:
         visible = {
@@ -43,20 +48,33 @@ def adapters():
         visible, error = {}, str(exc)
     items = []
     for row in rows:
-        guid = row["InterfaceGuid"].strip("{}").upper()
+        guid = adapter_guid(row["InterfaceGuid"])
         ident = fr"\Device\NPF_{{{guid}}}"
         items.append(dict(guid=guid, name=row["Name"], description=row["InterfaceDescription"],
                           status=row["Status"], speed=row["LinkSpeed"],
-                          interface=visible.get(ident.upper()), target=guid == GUID))
+                          interface=visible.get(ident.upper())))
     return {"items": items, "error": error}
+
 
 def _text(value):
     return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
 
+
 def check_adapter(ifname):
-    match = re.fullmatch(r"\\Device\\NPF_\{([0-9A-F-]{36})\}", ifname, re.I)
-    if not match or match[1].upper() != GUID:
-        raise ValueError("请选择已确认的 EtherCAT 网卡「以太网 3」")
+    match = re.fullmatch(r"\\Device\\NPF_\{([0-9A-F-]{36})\}", ifname, re.I) if isinstance(ifname, str) else None
+    if not match:
+        raise ValueError("请选择可用的 EtherCAT 有线网卡")
+    guid = adapter_guid(match[1])
+    result = adapters()
+    row = next((item for item in result["items"] if item["guid"] == guid), None)
+    if row is None:
+        raise ValueError("所选网卡不是当前 Windows 物理有线网卡")
+    if row["status"] != "Up":
+        raise ValueError(f"所选网卡「{row['name']}」链路未连接，请检查网线和 EK1100 电源")
+    if not row["interface"]:
+        raise ValueError(result["error"] or f"Npcap 无法访问网卡「{row['name']}」")
+    return row
+
 
 def identities(master):
     master.read_state()
@@ -70,12 +88,12 @@ def signed_default(slave, index):
             raise ValueError(f"{slave.name} CoE {index:04X}:{sub:02X} 为非默认缩放、表示或用户校准")
 
 class BusLock:
-    def __init__(self):
+    def __init__(self, guid):
         kernel = self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
         kernel.CreateMutexW.restype = ctypes.c_void_p
         kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-        self.handle = kernel.CreateMutexW(None, False, f"Local\\EtherCAT-Viewer-{GUID}")
+        self.handle = kernel.CreateMutexW(None, False, f"Local\\EtherCAT-Viewer-{guid}")
         error = ctypes.get_last_error()
         if not self.handle:
             raise ctypes.WinError(error)
@@ -90,7 +108,7 @@ class BusLock:
 
 class Hardware:
     def __init__(self, ifname):
-        check_adapter(ifname)
+        adapter = check_adapter(ifname)
         self.master = load_driver().Master()
         self.opened = False
         self.output_ready = False
@@ -98,9 +116,9 @@ class Hardware:
         self.mapping = {}
         self.expected = None
         self.watchdog = None
-        self.bus_lock = BusLock()
+        self.bus_lock = BusLock(adapter["guid"])
         try:
-            self.master.open(ifname)
+            self.master.open(adapter["interface"])
             self.opened = True
             self.master.config_init()
             self.devices = identities(self.master)
