@@ -1,7 +1,7 @@
 from queue import Empty, Full
 import time
 
-from .console import ConsoleStop, log_stop
+from .console import ConsoleStop, console_message, log_stop
 from .generator import DEFAULT_PERIOD_MS, build_wave, max_frequency, validated_period
 from .hardware import Hardware, adapters
 from .pdo import raw_voltage, validated_voltage, volts
@@ -270,3 +270,5 @@ def run_worker(commands, events, telemetry, lease, stop, cleanup_done):
             zero = "not_connected" if confirmed is None else "confirmed" if confirmed else "unknown"
             log_stop("worker_stop", zero=zero)
             cleanup_done.set()
+            if confirmed is not None:
+                console_message(f"EtherCAT 停止结果：{worker.zero}")

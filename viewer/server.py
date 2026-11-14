@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .console import log_stop
+from .console import BusConsole, console_message, log_stop
 from .generator import DEFAULT_PERIOD_MS
 from .timing import TimingWindow
 from .worker import run_worker
@@ -49,6 +49,7 @@ class Service:
         self.worker = ctx.Process(target=run_worker, args=(self.commands, self.events, self.telemetry,
                                                           self.lease, self.stop, self.cleanup_done))
         self.status = {"mode": "LIVE", "connection": "DISCONNECTED", "period_ms": DEFAULT_PERIOD_MS}
+        self.console = BusConsole(self.status)
         self.timing = TimingWindow()
         self.timing_summary = self.timing.summarize()
         self.last_summary = 0
@@ -145,9 +146,11 @@ class Service:
             if not self.worker.is_alive():
                 self.status.update(connection="FAULT", armed=False, ready=False,
                                    reason="EtherCAT 工作进程已退出", zero="输出状态未知")
-            elif self.last_update and time.monotonic() - self.last_update > 1:
+            elif (self.status["connection"] == "OP" and self.last_update
+                  and time.monotonic() - self.last_update > 1):
                 self.status.update(connection="STALE", armed=False, ready=False,
                                    reason="等待通信进程更新", zero="输出状态未知")
+            self.console.update(self.status)
             if self.status["connection"] != "OP" and self.recording:
                 self.record_stop()
             if batches or (self.status["connection"] in ("STALE", "FAULT")
@@ -173,6 +176,7 @@ async def lifespan(app):
         yield
     finally:
         service.stop.set()
+        console_message("正在停止服务，清理 EtherCAT 连接…")
         await asyncio.to_thread(service.worker.join, 2.5)
         pump.cancel()
         await asyncio.gather(pump, return_exceptions=True)

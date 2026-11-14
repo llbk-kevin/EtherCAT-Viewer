@@ -2,7 +2,7 @@
 
 Windows 10/11 x64 本地仪表盘。支持 Beckhoff EK1100 → EL3104 → EL4134。现场验证接线为 AO1 → AI1、AO2 → AI3、AO4 → AI4，均为双线回环。EL9011 是末端盖。
 
-双击项目目录中的 `start-viewer.cmd`，在 **EtherCAT Viewer 后端** 窗口查看启动和运行日志，然后打开 [EtherCAT Viewer](http://127.0.0.1:8765/)。也可以在现有 PowerShell 窗口运行：
+双击项目目录中的 `start-viewer.cmd`，在 **EtherCAT Viewer 后端** 窗口查看启动和状态变化日志。服务就绪后会用系统默认浏览器打开 [EtherCAT Viewer](http://127.0.0.1:8765/)，然后可在网页手动连接实机。若浏览器未打开，可手动访问窗口中的地址。也可以在现有 PowerShell 窗口运行：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
