@@ -70,7 +70,8 @@ class Worker:
 
     def ack(self, ident, result=None, error=None):
         payload = dict(kind="result", id=ident, ok=error is None, result=result, error=error)
-        self.events.put(payload, timeout=0.1)
+        if not emit(self.events, payload):
+            self.dropped += 1
 
     def command(self, command, now):
         ident, action, args, generation = (command[key] for key in ("id", "action", "args", "owner"))
@@ -172,8 +173,10 @@ class Worker:
                 self.errors += 1
                 actual_wkc = self.wkc
                 expected = self.expected
+                bus = self.bus
                 self.lock(error)
                 self.close_bus()
+                self.devices = bus.devices
                 self.wkc, self.expected = actual_wkc, expected
                 self.connection = "FAULT"
         elif self.mode == "SIMULATION" and self.connection == "RUNNING":
@@ -211,7 +214,7 @@ class Worker:
                     self.max_interval = max(self.max_interval, now - last)
                 last = now
                 batch.append(self.cycle(now))
-                if len(batch) == 5 or self.connection == "FAULT":
+                if len(batch) == 5:
                     if not emit(self.telemetry, dict(kind="samples", status=self.status(), samples=batch)):
                         self.dropped += len(batch)
                     batch = []

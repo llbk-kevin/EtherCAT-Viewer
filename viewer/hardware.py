@@ -187,15 +187,19 @@ class Hardware:
             if not self.opened:
                 return False
             if self.output_ready:
-                zero_ack = self.exchange([0] * 4) == self.expected and self.check_op()
-            if self.devices:
-                self.master.state = INIT
-                self.master.write_state()
+                zero_wkc = self.exchange([0] * 4)
+                in_op = self.check_op()
+                zero_ack = zero_wkc == self.expected and in_op
         finally:
             try:
                 if self.opened:
-                    self.master.close()
-                    self.opened = False
+                    try:
+                        if self.devices:
+                            self.master.state = INIT
+                            self.master.write_state()
+                    finally:
+                        self.master.close()
+                        self.opened = False
             finally:
                 self.bus_lock.close()
         return zero_ack

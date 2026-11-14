@@ -45,7 +45,7 @@
       </section>
     </div>
     <section class="panel diagnostic" aria-labelledby="diag-title">
-      <div class="panel-head"><div><h2 id="diag-title">总线诊断</h2><p id="timing">通信周期目标 10 ms</p></div><span id="wkc">WKC — / —</span></div>
+      <div class="panel-head"><div><h2 id="diag-title">总线诊断</h2><p id="timing">通信周期目标 10 ms</p></div><div class="counter"><span id="wkc">WKC — / —</span><details><summary>WKC 是什么</summary><p>每轮通信的处理回执。这里显示实际值 / 预期值。3 / 3 表示本轮所需的读写都得到了确认。−1 表示本轮未收到过程数据回应。通信异常时，输出锁定，输入读数标为失效。</p></details></div></div>
       <div class="table-wrap"><table><thead><tr><th>从站</th><th>厂商 / 产品</th><th>Revision</th><th>AL 状态</th><th>状态码</th></tr></thead><tbody id="devices"></tbody></table></div>
       <details id="mapping" hidden><summary>PDO 映射与看门狗配置</summary><pre id="mapping-text"></pre></details>
       <details class="reference">
