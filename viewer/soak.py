@@ -33,7 +33,7 @@ def main():
             if previous is not None:
                 intervals.append((now - previous) / 1e6)
             previous = now
-            counter = bus.exchange([0.0] * 4)
+            counter = bus.exchange([0.0] * len(bus.channels["ao"]))
             roundtrips.append((time.perf_counter_ns() - now) / 1e6)
             report["cycles"] += 1
             if counter != bus.expected:

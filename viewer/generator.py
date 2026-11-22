@@ -40,3 +40,34 @@ def build_wave(shape, peak, frequency, period_ms, now_ns):
     if type(frequency) not in (int, float) or not 0.01 <= frequency <= limit:
         raise ValueError(f"频率必须在 0.01–{limit:g} Hz 内")
     return Wave(shape, peak, frequency, now_ns)
+
+
+@dataclass(frozen=True)
+class TableWave:
+    table: tuple
+    rate: float
+    start_ns: int
+
+    @property
+    def frequency(self):
+        return self.rate / len(self.table) if len(set(self.table)) > 1 else 0
+
+    def voltage_at(self, now_ns):
+        return self.table[int(max(0, now_ns - self.start_ns) * self.rate / 1e9) % len(self.table)]
+
+    def reclock(self, rate, now_ns):
+        position = max(0, now_ns - self.start_ns) * self.rate / 1e9
+        return TableWave(self.table, rate, now_ns - round(position / rate * 1e9))
+
+
+def build_table(table, rate, period_ms, now_ns):
+    if not isinstance(table, (list, tuple)) or not 1 <= len(table) <= 65536:
+        raise ValueError("波形表需要 1–65536 个电压值")
+    from .pdo import validated_voltage
+    values = tuple(validated_voltage(v) for v in table)
+    if type(rate) not in (int, float) or not math.isfinite(rate) or not 0 < rate <= 13_000_000:
+        raise ValueError("波形更新率无效")
+    wave = TableWave(values, rate, now_ns)
+    if wave.frequency > max_frequency(period_ms):
+        raise ValueError(f"波形频率 {wave.frequency:g} Hz 超过当前周期上限 {max_frequency(period_ms):g} Hz")
+    return wave

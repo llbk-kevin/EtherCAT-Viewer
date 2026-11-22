@@ -17,6 +17,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from . import __version__
+from .bridge.runtime import Bridge
+from .bridge.config import local_addresses
 from .console import BusConsole, console_message, log_stop
 from .generator import DEFAULT_PERIOD_MS
 from .paths import data_root
@@ -37,7 +40,8 @@ def csv_rows(samples):
         writer.writerow([sample["seq"], sample["time_ns"], sample["mode"], sample["wkc"],
                          sample["expected_wkc"], *sample["raw"], *sample["ai"],
                          *sample["valid"], *(json.dumps(f) for f in sample["flags"]), *sample["ao"], sample["ao_valid"],
-                         sample["period_ms"], sample["interval_ms"], sample["roundtrip_ms"]])
+                         sample["period_ms"], sample["interval_ms"], sample["roundtrip_ms"],
+                         sample.get("host_send_ns"), sample.get("host_return_ns")])
     return stream.getvalue()
 
 class Service:
@@ -45,9 +49,10 @@ class Service:
         ctx = mp.get_context("spawn")
         self.commands, self.events, self.telemetry = ctx.Queue(8), ctx.Queue(32), ctx.Queue(16)
         self.lease, self.stop = ctx.Array("q", 2), ctx.Event()
+        self.source, self.emergency = ctx.Queue(64), ctx.Event()
         self.cleanup_done = ctx.Event()
         self.worker = ctx.Process(target=run_worker, args=(self.commands, self.events, self.telemetry,
-                                                          self.lease, self.stop, self.cleanup_done))
+                                                          self.lease, self.stop, self.cleanup_done, self.source, self.emergency))
         self.status = {"mode": "LIVE", "connection": "DISCONNECTED", "period_ms": DEFAULT_PERIOD_MS}
         self.console = BusConsole(self.status)
         self.timing = TimingWindow()
@@ -65,11 +70,39 @@ class Service:
         self.adapter_cache = None
         self.recent = deque(maxlen=3000)
         self.last_update = 0
+        self.bridge = Bridge(self.bridge_request, self.critical_zero)
         self.worker.start()
 
     def heartbeat(self):
         with self.lease.get_lock():
-            self.lease[:] = [self.generation, time.perf_counter_ns()] if self.controller else [0, 0]
+            self.lease[:] = [self.generation, time.perf_counter_ns()] if self.controller or self.bridge.active else [0, 0]
+
+    def critical_zero(self):
+        self.generation += 1
+        self.heartbeat()
+        self.emergency.set()
+
+    async def bridge_request(self, action, args):
+        answer = await worker_request(self, action, args, self.generation)
+        if not answer["ok"]:
+            raise ValueError(answer["error"])
+        return answer.get("result")
+
+    async def source_pump(self):
+        updated = time.monotonic()
+        while True:
+            if self.bridge.active:
+                self.heartbeat()
+            for _ in range(64):
+                try:
+                    packet = self.source.get_nowait()
+                except Empty:
+                    break
+                updated = time.monotonic()
+                self.bridge.feed(packet["status"], packet["samples"])
+            if self.bridge.active and (not self.worker.is_alive() or time.monotonic()-updated > 1):
+                self.bridge.fault("通信进程退出或原始数据过期")
+            await asyncio.sleep(.005)
 
     def detach(self, token):
         self.clients.pop(token, None)
@@ -88,19 +121,20 @@ class Service:
         self.record_error = None
         with target.open("x", encoding="utf-8-sig", newline="") as stream:
             csv.writer(stream).writerow(["seq", "monotonic_ns", "mode", "wkc", "expected_wkc",
-                                        *[f"{field}{i}" for field in ("raw", "ai_v", "valid", "flags", "ao_v")
-                                          for i in range(1, 5)],
-                                        "ao_valid", "target_period_ms", "interval_ms", "roundtrip_ms"])
+                                        *[f"{field}{i}" for field in ("raw", "ai_v", "valid", "flags")
+                                          for i in range(1, len(self.status.get("channels", {}).get("ai", [0]*4))+1)],
+                                        *[f"ao_v{i}" for i in range(1, len(self.status.get("ao", [0]*4))+1)],
+                                        "ao_valid", "target_period_ms", "interval_ms", "roundtrip_ms", "host_send_ns", "host_return_ns"])
         self.recording = target
 
     def record_stop(self):
         self.last_recording, self.recording = self.recording or self.last_recording, None
 
     def status_for(self, token):
-        return dict(self.status, controller=self.controller == token, controller_busy=bool(self.controller),
+        return dict(self.status, app_version=__version__, controller=self.controller == token, controller_busy=bool(self.controller),
                     recording=self.recording is not None, export=self.last_recording is not None,
                     record_error=self.record_error, timing=self.timing_summary,
-                    viewer_drops=self.viewer_drops.get(token, 0))
+                    viewer_drops=self.viewer_drops.get(token, 0), bridge=self.bridge.status())
 
     async def pump(self):
         while True:
@@ -124,6 +158,7 @@ class Service:
                 self.status = packet["status"]
                 if self.status["session"] != self.connection_session:
                     self.connection_session = self.status["session"]
+                    self.recent.clear()
                     self.timing = TimingWindow()
                     self.timing_summary = self.timing.summarize()
                     self.last_summary = 0
@@ -172,14 +207,17 @@ def append_recording(path, content):
 async def lifespan(app):
     service = app.state.service = Service()
     pump = asyncio.create_task(service.pump())
+    source = asyncio.create_task(service.source_pump())
     try:
         yield
     finally:
         service.stop.set()
+        await service.bridge.stop("服务退出", shutdown=True)
         console_message("正在停止服务，清理 EtherCAT 连接…")
         await asyncio.to_thread(service.worker.join, 2.5)
         pump.cancel()
-        await asyncio.gather(pump, return_exceptions=True)
+        source.cancel()
+        await asyncio.gather(pump, source, return_exceptions=True)
         if service.worker.is_alive():
             log_stop("worker_stop_timeout", worker_pid=service.worker.pid, zero="unknown")
             service.worker.terminate()
@@ -227,6 +265,10 @@ async def get_adapters(request: Request):
     service.adapter_cache = answer["result"]
     return service.adapter_cache
 
+@app.get("/api/bridge/network")
+async def bridge_network():
+    return {"addresses": await asyncio.to_thread(local_addresses)}
+
 @app.post("/api/commands")
 async def commands(command: Command, request: Request):
     service = request.app.state.service
@@ -237,13 +279,36 @@ async def commands(command: Command, request: Request):
     if action == "claim":
         if service.controller not in (None, token):
             raise HTTPException(409, "另一浏览器正在控制")
-        if service.controller is None:
+        if service.controller is None and not service.bridge.active:
             service.generation += 1
         service.controller = token
         service.heartbeat()
         return dict(id=command.id, ok=True, result=service.status_for(token))
     if service.controller != token:
         raise HTTPException(403, "请先取得控制权")
+    if action.startswith("bridge_"):
+        try:
+            if action == "bridge_preset":
+                result = service.bridge.make_preset(command.args.get("profile"), service.status)
+            elif action == "bridge_save":
+                result = await service.bridge.configure(command.args["config"], service.status)
+            elif action == "bridge_start":
+                await service.bridge.start(service.status)
+                result = None
+            elif action == "bridge_authorize":
+                await service.bridge.authorize(command.args["card"])
+                result = None
+            elif action == "bridge_stop":
+                await service.bridge.stop()
+                result = None
+            else:
+                raise ValueError("未知桥接管理操作")
+            return dict(id=command.id, ok=True, result=service.status_for(token), config=result)
+        except (OSError, ValueError, KeyError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+    if action in ("zero", "disconnect"):
+        service.critical_zero()
+        await service.bridge.stop("网页清零并收回控制权")
     if action in ("record_start", "record_stop"):
         if action == "record_start" and service.status["connection"] != "OP":
             raise HTTPException(409, "请先连接实机")

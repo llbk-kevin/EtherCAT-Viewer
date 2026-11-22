@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/static/style.css">
   <script defer src="/static/vendor/uPlot.iife.min.js"></script>
   <script defer src="/static/charts.js"></script>
+  <script defer src="/static/bridge.js"></script>
   <script defer src="/static/app.js"></script>
   <script defer src="/static/reference.js"></script>
 </head>
@@ -33,10 +34,33 @@
       </div>
     </section>
     <p id="message" role="status" hidden></p>
+    <section class="panel bridge-panel" aria-labelledby="bridge-title">
+      <div class="section-head">
+        <div><h2 id="bridge-title">中瑞协议桥接</h2><p id="bridge-mode">网页调试</p></div>
+        <button class="danger" id="bridge-reclaim">清零并收回控制权</button>
+      </div>
+      <p id="bridge-source" class="muted"></p>
+      <p>原版兼容端口供现有软件使用，扩展 v1 提供更多通道、时间戳及只读观察。未映射 AI 固定为零。逻辑采样率和真实更新率分别统计。</p>
+      <div class="group">
+        <button id="bridge-legacy">原版卡预设</button>
+        <button id="bridge-extended">扩展卡预设</button>
+        <button id="bridge-add">增加虚拟卡</button>
+        <button id="bridge-verify">按当前拓扑重新核对</button>
+        <button id="bridge-save">保存配置</button>
+        <button class="primary" id="bridge-start">开始监听</button>
+        <button id="bridge-stop">停止发布并清零</button>
+      </div>
+      <p id="bridge-error" class="mapping-warning" role="status"></p>
+      <p id="bridge-config-state" class="muted"></p>
+      <div id="bridge-config"></div>
+      <div id="bridge-runtime"></div>
+      <details><summary>桥接最近事件</summary><pre id="bridge-events"></pre></details>
+    </section>
     <section class="scope" aria-labelledby="scope-title">
       <div class="section-head">
         <div><h2 id="scope-title">实时波形</h2><p>时间 / s · 电压 / V · 滚轮缩放 · 拖拽框选</p></div>
         <div class="group">
+          <select id="module-filter" aria-label="查看模块"><option value="">全部模块</option></select>
           <span id="time-window">30.0 s · 实时</span>
           <button id="zoom-in" aria-label="缩短时间窗">− 时间窗</button>
           <button id="zoom-out" aria-label="延长时间窗">+ 时间窗</button>
@@ -70,7 +94,7 @@
         </form>
         <p id="fault-detail" role="status"></p>
         <details><summary>最近 10 秒统计与从站详情</summary>
-          <p>周期间隔是相邻两次交换的起始间隔，收发耗时是单次主站发送至接收返回的时间。WKC 是处理回执，3 / 3 表示本轮所需读写均获确认。−1 表示未收到回应。</p>
+          <p>周期间隔是相邻两次交换的起始间隔，收发耗时是单次主站发送至接收返回的时间。WKC 是处理回执，实际值与当前拓扑的预期值一致，表示本轮所需读写均获确认（现有三从站为 3 / 3）。−1 表示未收到回应。</p>
           <div class="table-wrap"><table><thead><tr><th>指标</th><th>最新</th><th>中位数</th><th>P95</th><th>最大</th><th>样本</th></tr></thead><tbody id="timing-details"></tbody></table></div>
           <p id="viewer-drops"></p>
           <div class="table-wrap"><table><thead><tr><th>从站</th><th>厂商 / 产品</th><th>Revision</th><th>AL 状态</th><th>状态码</th></tr></thead><tbody id="devices"></tbody></table></div>

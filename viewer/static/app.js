@@ -5,14 +5,21 @@ const channelCards = [];
 let socket, token, lastSample, sequence = 0, pending = false;
 let state = {}, lastFrame = 0, pendingPeriod = false;
 
-function channelCard(channel, output) {
+function channelCard(channel, output, source) {
   const name = (output ? "AO" : "AI") + channel;
   const card = document.createElement("article");
   card.className = "chart-card";
-  card.style.setProperty("--trace", traceColors[channel - 1]);
+  card.style.setProperty("--trace", traceColors[(channel - 1) % 4]);
   card.innerHTML = '<div class="chart-head"><strong>' + name + '</strong>' +
     '<output class="reading" aria-label="' + name + ' 电压">—</output></div>' +
     '<div class="plot" aria-label="' + name + ' 电压波形"></div>';
+  card.dataset.module = source ? String(source.slave_position) : "";
+  if (source) {
+    const origin = document.createElement("p");
+    origin.className = "channel-origin";
+    origin.textContent = source.label;
+    card.insertBefore(origin, card.querySelector(".plot"));
+  }
   if (output) {
     const form = document.createElement("form");
     form.className = "generator";
@@ -39,18 +46,44 @@ function channelCard(channel, output) {
   }
   el(output ? "outputs" : "inputs").append(card);
   channelCards.push(card);
-  charts.attach(card.querySelector(".plot"), channelCards.length - 1);
+  charts.attach(card.querySelector(".plot"), channelCards.length - 1, output);
 }
 
-for (const output of [true, false]) {
-  for (let channel = 1; channel <= 4; channel++) channelCard(channel, output);
+let channelLayout = "";
+let aoCount = 4;
+const bridgePanel = new BridgePanel((action, args = {}) => command(action, args));
+function ensureChannels() {
+  const known = !!state.fingerprint;
+  const channels = known ? state.channels : {ai: Array.from({length: 4}, () => null), ao: Array.from({length: 4}, () => null)};
+  if (!channels) return;
+  const key = JSON.stringify([state.fingerprint, channels.ai, channels.ao]);
+  if (key === channelLayout) return;
+  channelLayout = key;
+  charts.reset();
+  channelCards.length = 0;
+  el("outputs").replaceChildren();
+  el("inputs").replaceChildren();
+  aoCount = channels.ao.length;
+  for (const output of [true, false]) {
+    channels[output ? "ao" : "ai"].forEach((source, i) => channelCard(i + 1, output, source));
+  }
+  const filter = el("module-filter"), previous = filter.value;
+  filter.replaceChildren(new Option("全部模块", ""));
+  const modules = new Map([...channels.ai, ...channels.ao].filter(Boolean).map(c => [String(c.slave_position), c.module]));
+  for (const [position, name] of modules) filter.add(new Option("从站 " + position + " · " + name, position));
+  filter.value = [...filter.options].some(o => o.value === previous) ? previous : "";
+  filter.onchange();
 }
+el("module-filter").onchange = () => {
+  channelCards.forEach(card => card.hidden = !!el("module-filter").value && card.dataset.module !== el("module-filter").value);
+};
+
 el("zoom-in").onclick = () => charts.zoom(0.5);
 el("zoom-out").onclick = () => charts.zoom(2);
 el("follow").onclick = () => charts.follow();
 
 function canOutput() {
-  return token && state.controller && state.connection === "OP" && state.armed && !pending;
+  return token && state.controller && state.connection === "OP" && state.armed && !state.bridge?.active && !pending;
 }
 function text(id, value) {
   const node = el(id);
@@ -104,7 +137,7 @@ function renderDiagnostics(online) {
   text("wkc", online ? (state.wkc ?? "—") + " / " + (state.expected_wkc ?? "—") : "—");
   text("error-metric", String(state.errors ?? 0));
   text("missed-metric", String(state.missed ?? 0));
-  text("bus-summary", online ? (state.devices?.length ?? 0) + " 个从站处于 OP · 看门狗 " + state.watchdog_ms + " ms" : "等待实机连接");
+  text("bus-summary", online ? (state.devices?.length ?? 0) + " 个从站处于 OP · " + (state.watchdog_ms == null ? "无 AO 看门狗" : "看门狗 " + state.watchdog_ms + " ms") : "等待实机连接");
   const lastWkc = !online && state.wkc != null ? " · 最后 WKC " + state.wkc + "/" + state.expected_wkc : "";
   const lastError = state.last_error && state.last_error !== state.reason ? "上次异常 " + state.last_error : "";
   text("fault-detail", [...new Set([state.reason, state.zero, lastError].filter(Boolean))].join(" · ") + lastWkc);
@@ -120,6 +153,7 @@ function renderDiagnostics(online) {
 }
 
 function render() {
+  ensureChannels();
   const online = token && state.connection === "OP";
   const controller = token && state.controller;
   text("connection", online ? "已连接 · OP" : pending && state.connection === "CONNECTING" ? "连接中" : "掉线");
@@ -130,21 +164,23 @@ function render() {
   el("disconnect").disabled = !controller || !online || pending;
   el("refresh").disabled = !token || online || pending;
   el("adapters").disabled = !token || online || pending;
-  el("arm").disabled = !controller || !online || !state.ready || state.armed || pending;
-  el("zero").disabled = !controller || !online || pending;
+  el("arm").disabled = !controller || !online || !state.ready || state.armed || state.bridge?.active || pending;
+  el("zero").disabled = !controller || !online;
+  text("zero", state.bridge?.active ? "清零并收回控制权" : "清零并锁定");
   text("lock", online && state.armed ? "输出已解锁" : "输出已锁定");
   el("record").disabled = !controller || (!online && !state.recording) || pending;
   text("record", state.recording ? "停止记录" : "开始记录");
   el("export").hidden = !state.export;
-  el("period-form").querySelector("button").disabled = !controller || pending;
+  el("period-form").querySelector("button").disabled = !controller || state.bridge?.active || pending;
   if (!pendingPeriod && document.activeElement !== el("period")) el("period").value = state.period_ms || 10;
   const samples = online && lastSample?.session === state.session ? lastSample : null;
   channelCards.forEach((card, index) => {
-    const value = index < 4 ? samples?.ao[index] : samples?.ai[index - 4];
+    const value = index < aoCount ? samples?.ao[index] : samples?.ai[index - aoCount];
     card.querySelector(".reading").textContent = format(value, 3, " V");
-    if (index < 4) renderGenerator(card.querySelector(".generator"), canOutput());
+    if (index < aoCount) renderGenerator(card.querySelector(".generator"), canOutput());
   });
   renderDiagnostics(online);
+  bridgePanel.render(state, pending);
 }
 
 async function refresh() {
@@ -168,7 +204,7 @@ async function refresh() {
 }
 
 async function command(action, args = {}) {
-  if (!token || pending) return;
+  if (!token || (pending && action !== "zero")) return;
   pending = true;
   render();
   try {
@@ -183,6 +219,7 @@ async function command(action, args = {}) {
       el("period").value = state.period_ms;
     }
     showMessage(action === "zero" ? "已清零并锁定输出" : "");
+    return data;
   } catch (error) { showMessage(error.message, true); }
   finally { pending = false; render(); }
 }
@@ -218,6 +255,7 @@ function connectWebSocket() {
       if (!el("adapters").value) refresh();
     }
     state = packet.status;
+    ensureChannels();
     if (packet.samples.length) {
       lastSample = packet.samples.at(-1);
       charts.append(packet.samples);

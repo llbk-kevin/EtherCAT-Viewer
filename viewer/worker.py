@@ -2,7 +2,7 @@ from queue import Empty, Full
 import time
 
 from .console import ConsoleStop, console_message, log_stop
-from .generator import DEFAULT_PERIOD_MS, build_wave, max_frequency, validated_period
+from .generator import DEFAULT_PERIOD_MS, TableWave, build_table, build_wave, max_frequency, validated_period
 from .hardware import Hardware, adapters
 from .pdo import raw_voltage, validated_voltage, volts
 
@@ -19,9 +19,14 @@ def emit(queue, message):
 
 
 class Worker:
-    def __init__(self, commands, events, telemetry, lease, stop):
+    def __init__(self, commands, events, telemetry, lease, stop, source=None, emergency=None):
         self.commands, self.events, self.telemetry = commands, events, telemetry
         self.lease, self.stop = lease, stop
+        self.source, self.emergency = source, emergency
+        self.control_mode = "WEB"
+        self.bridge_cards, self.bridge_generation = {}, 0
+        self.channels = {"ai": [], "ao": []}
+        self.source_drops = 0
         self.bus = None
         self.connection = "DISCONNECTED"
         self.reason = self.last_error = ""
@@ -43,9 +48,16 @@ class Worker:
         return self.period_ms * 1_000_000
 
     def lock(self, reason=""):
+        if reason:
+            for ident in self.pending_acks:
+                self.ack(ident, error=reason)
+            self.pending_acks.clear()
         self.owner = 0
-        self.values = [0.0] * 4
+        self.values = [0.0] * len(self.values)
         self.wave.clear()
+        self.bridge_cards = {}
+        self.bridge_generation = 0
+        self.control_mode = "WEB"
         self.reason = reason
 
     def close_bus(self):
@@ -64,7 +76,10 @@ class Worker:
         return confirmed
 
     def status(self):
-        return dict(mode="LIVE", connection=self.connection, armed=bool(self.owner),
+        return dict(mode="LIVE", connection=self.connection, armed=bool(self.owner) or any(c["armed"] for c in self.bridge_cards.values()),
+                    control_mode=self.control_mode, bridge_cards={k: dict(v) for k, v in self.bridge_cards.items()},
+                    channels=self.channels, fingerprint=self.mapping.get("fingerprint", ""),
+                    source_drops=self.source_drops,
                     reason=self.reason, last_error=self.last_error, zero=self.zero,
                     devices=self.devices, mapping=self.mapping, wkc=self.wkc,
                     expected_wkc=self.expected, watchdog_ms=self.watchdog, errors=self.errors,
@@ -95,6 +110,8 @@ class Worker:
             self.bus = Hardware(interface)
             self.bus.configure()
             self.devices, self.mapping = self.bus.devices, self.bus.mapping
+            self.channels = self.bus.channels
+            self.values = [0.0] * len(self.channels["ao"])
             self.watchdog, self.expected = self.bus.watchdog, self.bus.expected
             self.session += 1
             self.errors = self.dropped = self.missed = self.lost_results = 0
@@ -118,6 +135,10 @@ class Worker:
                 return self.ack(ident, adapters())
             if not self.lease_valid(generation, now):
                 raise ValueError("控制会话已失效")
+            if action.startswith("bridge_"):
+                return self.bridge_command(ident, action, args, generation, now)
+            if self.control_mode == "TCP" and action not in ("zero", "disconnect"):
+                raise ValueError("TCP 已接管，请先清零并收回控制权")
             if action == "connect":
                 self.connect(args["interface"])
             elif action == "disconnect":
@@ -151,8 +172,8 @@ class Worker:
                 if self.owner != generation or not self.status()["ready"]:
                     raise ValueError("请先解锁输出")
                 channel = args.get("channel")
-                if type(channel) is not int or channel not in (1, 2, 3, 4):
-                    raise ValueError("输出通道必须为 AO1–AO4")
+                if type(channel) is not int or not 1 <= channel <= len(self.values):
+                    raise ValueError("输出通道编号无效")
                 index = channel - 1
                 if action == "wave":
                     self.wave[index] = build_wave(args.get("shape"), args.get("peak"),
@@ -169,11 +190,87 @@ class Worker:
         except Exception as exc:
             self.ack(ident, error=str(exc))
 
+    def zero_channels(self, channels):
+        for index in channels:
+            self.values[index] = 0.0
+            self.wave.pop(index, None)
+
+    def bridge_command(self, ident, action, args, generation, now):
+        if action == "bridge_setup":
+            if self.control_mode != "WEB" or not self.status()["ready"]:
+                raise ValueError("请先停止发布，并等待实机稳定")
+            cards, used = {}, set()
+            for card in args["cards"]:
+                outputs = card["outputs"]
+                if (not isinstance(card["id"], str) or card["id"] in cards or
+                        len(outputs) != len(set(outputs)) or
+                        any(type(i) is not int or not 0 <= i < len(self.values) or i in used for i in outputs)):
+                    raise ValueError("虚拟卡输出占用无效或重复")
+                used.update(outputs)
+                cards[card["id"]] = dict(outputs=outputs, token=None, armed=False)
+            self.lock()
+            self.bridge_cards = cards
+            self.control_mode, self.bridge_generation = "TCP", generation
+        else:
+            if self.control_mode != "TCP" or self.bridge_generation != generation:
+                raise ValueError("TCP 控制代次已失效")
+            card = self.bridge_cards.get(args.get("card"))
+            if card is None:
+                raise ValueError("虚拟卡未登记")
+            if action == "bridge_authorize":
+                if card["token"]:
+                    raise ValueError("请先断开该卡的控制客户端")
+                self.zero_channels(card["outputs"])
+                card["armed"] = True
+            elif action == "bridge_claim":
+                if not card["armed"] or card["token"] is not None:
+                    raise ValueError("请在网页授权该卡接管，或释放现有控制连接")
+                card["token"] = args["token"]
+            else:
+                if not card["token"] or card["token"] != args.get("token"):
+                    raise ValueError("该连接没有虚拟卡控制权")
+                if action == "bridge_release":
+                    self.zero_channels(card["outputs"])
+                    card.update(token=None, armed=False)
+                elif action in ("bridge_output", "bridge_table"):
+                    if not self.status()["ready"]:
+                        raise ValueError("实机未就绪")
+                    changes = args["changes"]
+                    prepared = []
+                    for item in changes:
+                        index = item["index"]
+                        if type(index) is not int or index not in card["outputs"]:
+                            raise ValueError("超出该虚拟卡的输出范围")
+                        value = (build_table(item["table"], item["rate"], self.period_ms, now)
+                                 if action == "bridge_table" else validated_voltage(item["voltage"]))
+                        prepared.append((index, value))
+                    for index, value in prepared:
+                        if action == "bridge_table":
+                            self.wave[index] = value
+                        else:
+                            self.wave.pop(index, None)
+                            self.values[index] = value
+                elif action == "bridge_rate":
+                    build_table([0.0], args["rate"], self.period_ms, now)
+                    prepared = {}
+                    for index in card["outputs"]:
+                        wave = self.wave.get(index)
+                        if isinstance(wave, TableWave):
+                            checked = build_table(wave.table, args["rate"], self.period_ms, now)
+                            prepared[index] = wave.reclock(checked.rate, now)
+                    self.wave.update(prepared)
+                else:
+                    raise ValueError("未知桥接命令")
+        self.pending_acks.append(ident)
+
     def cycle(self, now):
         if self.owner and not self.lease_valid(self.owner, now):
             self.lock("控制会话失联，已撤销输出")
-        raw, flags, valid = [None] * 4, [None] * 4, [False] * 4
-        confirmed = [None] * 4
+        if self.control_mode == "TCP" and not self.lease_valid(self.bridge_generation, now):
+            self.lock("桥接服务租约失效，已撤销全部输出")
+        count = len(self.channels["ai"]) if self.channels["ai"] or self.mapping else 4
+        raw, flags, valid = [None] * count, [None] * count, [False] * count
+        confirmed = [None] * len(self.values)
         error = None
         interval = roundtrip = None
         if self.bus:
@@ -214,7 +311,9 @@ class Worker:
         self.pending_acks.clear()
         self.seq += 1
         return dict(seq=self.seq, time_ns=now, mode="LIVE", session=self.session,
-                    raw=raw, flags=flags, valid=valid, ao_valid=confirmed[0] is not None,
+                    raw=raw, flags=flags, valid=valid, ao_valid=self.bus is not None and error is None,
+                    host_send_ns=getattr(self.bus, "last_send_ns", None),
+                    host_return_ns=getattr(self.bus, "last_receive_ns", None),
                     ai=[volts(x) if ok else None for x, ok in zip(raw, valid)],
                     ao=confirmed, wkc=self.wkc, expected_wkc=self.expected,
                     interval_ms=interval, roundtrip_ms=roundtrip, period_ms=self.period_ms)
@@ -224,6 +323,9 @@ class Worker:
         publish_at = deadline
         batch = []
         while not self.stop.is_set():
+            if self.emergency is not None and self.emergency.is_set():
+                self.lock("优先清零已执行")
+                self.emergency.clear()
             revision = self.period_revision
             session = self.session
             try:
@@ -239,6 +341,8 @@ class Worker:
             if not online and self.owner:
                 self.lock()
             if now >= publish_at or (online and self.bus is None):
+                if self.source is not None and not emit(self.source, dict(status=self.status(), samples=batch)):
+                    self.source_drops += len(batch)
                 if not emit(self.telemetry, dict(status=self.status(), samples=batch)):
                     self.dropped += len(batch)
                 batch = []
@@ -257,8 +361,8 @@ class Worker:
             time.sleep(max(0, (deadline - time.perf_counter_ns()) / 1e9))
 
 
-def run_worker(commands, events, telemetry, lease, stop, cleanup_done):
-    worker = Worker(commands, events, telemetry, lease, stop)
+def run_worker(commands, events, telemetry, lease, stop, cleanup_done, source=None, emergency=None):
+    worker = Worker(commands, events, telemetry, lease, stop, source, emergency)
     with ConsoleStop(lambda source: worker.stop.set()):
         try:
             worker.run()

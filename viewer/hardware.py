@@ -106,89 +106,121 @@ class BusLock:
             self.kernel.CloseHandle(self.handle)
             self.handle = None
 
+def validate_topology(slaves):
+    if len(slaves) < 2 or (slaves[0].man, slaves[0].id) != (2, EXPECTED[0][0]):
+        raise ValueError("从站链必须以 EK1100 开始，并至少包含一个支持的 IO 模块")
+    for position, slave in enumerate(slaves[1:], 2):
+        if slave.man != 2 or slave.id not in (EXPECTED[1][0], EXPECTED[2][0]):
+            raise ValueError(f"从站 {position} 不支持：{slave.name} / 0x{slave.id:08X}")
+
+
+def channel_catalog(slaves):
+    import hashlib
+    signature = [(i, s.man, s.id, s.rev) for i, s in enumerate(slaves, 1)]
+    channels = {"ai": [], "ao": []}
+    for position, slave in enumerate(slaves[1:], 2):
+        kind = "ai" if slave.id == EXPECTED[1][0] else "ao"
+        model = "EL3104" if kind == "ai" else "EL4134"
+        for ch in range(1, 5):
+            channels[kind].append(dict(id=f"s{position}:{model}:{kind.upper()}{ch}",
+                                      label=f"从站 {position} · {model} · {kind.upper()}{ch}",
+                                      slave_position=position, module=model, channel=ch))
+    fingerprint = hashlib.sha256(json.dumps(signature).encode()).hexdigest()
+    return channels, fingerprint
+
+
 class Hardware:
     def __init__(self, ifname):
         adapter = check_adapter(ifname)
         self.master = load_driver().Master()
-        self.opened = False
-        self.output_ready = False
-        self.devices = []
-        self.mapping = {}
-        self.expected = None
-        self.watchdog = None
+        self.opened = self.output_ready = False
+        self.devices, self.mapping = [], {}
+        self.channels = {"ai": [], "ao": []}
+        self.fingerprint = ""
+        self.ai_modules, self.ao_modules = [], []
+        self.expected = self.watchdog = None
         self.bus_lock = BusLock(adapter["guid"])
         try:
             self.master.open(adapter["interface"])
             self.opened = True
             self.master.config_init()
             self.devices = identities(self.master)
-            if [(s.man, s.id) for s in self.master.slaves] != [(2, p) for p, _ in EXPECTED]:
-                raise ValueError(f"从站链与现场记录不一致：{self.devices}")
-            _, self.ai_slave, self.ao_slave = self.master.slaves
+            validate_topology(self.master.slaves)
+            self.channels, self.fingerprint = channel_catalog(self.master.slaves)
+            for slave in self.master.slaves[1:]:
+                (self.ai_modules if slave.id == EXPECTED[1][0] else self.ao_modules).append([slave, None])
         except Exception:
             self.close()
             raise
 
     def configure(self):
-        for ch in range(4):
-            idx = 0x8000 + 16 * ch
-            signed_default(self.ai_slave, idx)
-            signed_default(self.ao_slave, idx)
-            if read_int(self.ao_slave, idx, 5, 1) != 0 or read_int(self.ao_slave, idx, 0x13, 2, True) != 0:
-                raise ValueError(f"EL4134 通道 {ch+1} 的看门狗替代值需要核实为零")
-        inputs = read_mapping(self.ai_slave, 0x1C13)
-        outputs = read_mapping(self.ao_slave, 0x1C12)
+        pending = []
+        for modules, output in ((self.ai_modules, False), (self.ao_modules, True)):
+            for pair in modules:
+                slave = pair[0]
+                for ch in range(4):
+                    idx = 0x8000 + 16 * ch
+                    signed_default(slave, idx)
+                    if output and (read_int(slave, idx, 5, 1) != 0 or
+                                   read_int(slave, idx, 0x13, 2, True) != 0):
+                        raise ValueError(f"{slave.name} 通道 {ch+1} 看门狗替代值必须为零")
+                pending.append((pair, output, read_mapping(slave, 0x1C12 if output else 0x1C13)))
         self.master.manual_state_change = 1
         self.master.config_map()
-        # Enable the ESC watchdog trigger while the output SM is in PREOP.
-        sm = self.ao_slave._fprd(0x0810, 8, 2000)
-        if int.from_bytes(sm[2:4], "little") != 8 or not sm[4] & 0x04:
-            raise RuntimeError(f"EL4134 SM2 方向或长度异常：{sm.hex()}")
-        if not sm[4] & 0x40:
-            self.ao_slave._fpwr(0x0816, bytes([sm[6] & ~1]), 2000)
-            try:
-                self.ao_slave._fpwr(0x0814, bytes([sm[4] | 0x40]), 2000)
-            finally:
-                self.ao_slave._fpwr(0x0816, bytes([sm[6]]), 2000)
+        sm_details = []
+        for slave, _mapping in self.ao_modules:
+            sm = slave._fprd(0x0810, 8, 2000)
+            if int.from_bytes(sm[2:4], "little") != 8 or not sm[4] & 0x04:
+                raise RuntimeError(f"{slave.name} SM2 方向或长度异常：{sm.hex()}")
+            if not sm[4] & 0x40:
+                slave._fpwr(0x0816, bytes([sm[6] & ~1]), 2000)
+                try:
+                    slave._fpwr(0x0814, bytes([sm[4] | 0x40]), 2000)
+                finally:
+                    slave._fpwr(0x0816, bytes([sm[6]]), 2000)
+            sm_details.append({"original": sm[4], "active": slave._fprd(0x0814, 1, 2000)[0]})
+        for pair, output, entries in pending:
+            pair[1] = Mapping(entries, len(pair[0].output if output else pair[0].input), output)
+        self.output_ready = True
+        self.mapping = dict(ai=[m.describe() for _, m in self.ai_modules],
+                            ao=[m.describe() for _, m in self.ao_modules],
+                            channels=self.channels, fingerprint=self.fingerprint, sm2=sm_details)
+        watchdogs = []
+        for slave, _ in self.ao_modules:
+            value = slave.get_watchdog("processdata")
+            if not 90 <= value <= 110:
+                slave.set_watchdog("processdata", 100)
+                value = slave.get_watchdog("processdata")
+            if not 90 <= value <= 110 or not slave._fprd(0x0814, 1, 2000)[0] & 0x40:
+                raise RuntimeError(f"{slave.name} 过程数据看门狗回读异常：{value} ms")
+            watchdogs.append(value)
+        self.watchdog = max(watchdogs) if watchdogs else None
+        self.mapping["watchdogs_ms"] = watchdogs
+        self.expected = self.master.expected_wkc
+        if self.expected <= 0:
+            raise RuntimeError("PDO 预期 WKC 无效")
         self.master.state = SAFEOP
         self.master.write_state()
         self.master.state_check(SAFEOP, 2000000)
         self.devices = identities(self.master)
-        if any(slave.state != SAFEOP for slave in self.master.slaves):
+        if any(s.state != SAFEOP for s in self.master.slaves):
             raise RuntimeError(f"未进入 SAFEOP：{self.devices}")
-        self.input = Mapping(inputs, len(self.ai_slave.input))
-        self.output = Mapping(outputs, len(self.ao_slave.output), output=True)
-        self.mapping = {"ai": self.input.describe(), "ao": self.output.describe(),
-                        "sm2_control_original": sm[4],
-                        "sm2_control_active": self.ao_slave._fprd(0x0814, 1, 2000)[0]}
-        self.expected = self.master.expected_wkc
-        if self.expected <= 0:
-            raise RuntimeError("PDO 预期 WKC 无效")
-        self.watchdog = self.ao_slave.get_watchdog("processdata")
-        if not 90 <= self.watchdog <= 110:
-            old = self.watchdog
-            self.ao_slave.set_watchdog("processdata", 100)
-            self.watchdog = self.ao_slave.get_watchdog("processdata")
-            self.mapping["watchdog_previous_ms"] = old
-        if not 90 <= self.watchdog <= 110:
-            raise RuntimeError(f"过程数据看门狗回读异常：{self.watchdog} ms")
-        # SM2 control bit 6 enables the process-data watchdog.
-        if not self.ao_slave._fprd(0x0814, 1, 2000)[0] & 0x40:
-            raise RuntimeError("EL4134 SM2 未启用过程数据看门狗")
-        self.output_ready = True
-        self.exchange([0] * 4)
+        self.exchange([0] * len(self.channels["ao"]))
         self.master.state = OP
         self.master.write_state()
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            wkc = self.exchange([0] * 4)
+            wkc = self.exchange([0] * len(self.channels["ao"]))
             if self.master.state_check(OP, 2000) == OP and wkc == self.expected and self.check_op():
                 return
             time.sleep(0.01)
         raise RuntimeError(f"未进入 OP：{identities(self.master)}")
 
     def exchange(self, values):
-        self.ao_slave.output = self.output.encode(values)
+        if len(values) != len(self.channels["ao"]):
+            raise ValueError("输出通道数量不匹配")
+        for i, (slave, mapping) in enumerate(self.ao_modules):
+            slave.output = mapping.encode(values[i*4:i*4+4])
         self.last_send_ns = time.perf_counter_ns()
         self.master.send_processdata()
         try:
@@ -201,7 +233,12 @@ class Hardware:
         return all(s.state == OP and s.al_status == 0 for s in self.master.slaves)
 
     def read(self):
-        return self.input.decode(self.ai_slave.input)
+        raw, flags = [], []
+        for slave, mapping in self.ai_modules:
+            r, f = mapping.decode(slave.input)
+            raw.extend(r)
+            flags.extend(f)
+        return raw, flags
 
     def close(self):
         zero_ack = False
@@ -209,9 +246,8 @@ class Hardware:
             if not self.opened:
                 return False
             if self.output_ready:
-                zero_wkc = self.exchange([0] * 4)
-                in_op = self.check_op()
-                zero_ack = zero_wkc == self.expected and in_op
+                zero_wkc = self.exchange([0] * len(self.channels["ao"]))
+                zero_ack = self.check_op() and zero_wkc == self.expected
         finally:
             try:
                 if self.opened:

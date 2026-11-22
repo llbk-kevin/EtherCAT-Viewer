@@ -74,3 +74,24 @@ pre { max-height: 220px; overflow: auto; }
 [hidden] { display: none !important; }
 @media (max-width: 1050px) { .chart-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } .metrics { grid-template-columns: repeat(4,minmax(0,1fr)); } }
 @media (max-width: 540px) { main { padding: 8px; } .chart-card { padding: 5px; } .generator-form { grid-template-columns: 1fr 1fr; } .generator-form label:first-child { grid-column: span 2; } .reading { font-size: 15px; } .metrics { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+
+.bridge-panel { margin-top:14px; padding:16px; }
+.bridge-panel > p { margin:8px 0; line-height:1.6; }
+#bridge-runtime { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr)); gap:12px; margin-top:12px; }
+.bridge-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+.bridge-grid label, .bridge-mappings label { display:flex; flex-direction:column; gap:5px; font-size:13px; color:#354b64; }
+.bridge-fields { border:0; padding:16px 0 0; min-width:0; }
+.bridge-grid input, .bridge-grid select, .bridge-mappings select { width:100%; min-width:0; }
+.virtual-card { border:1px solid #d6e0eb; border-radius:8px; margin-top:12px; padding:12px; }
+.virtual-card summary { font-weight:600; cursor:pointer; }
+.bridge-mappings { display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-bottom:14px; }
+.bridge-mappings label { display:grid; grid-template-columns:55px 1fr; align-items:center; margin-bottom:8px; }
+.mapping-warning { color:#8a3900; background:#fff3e6; border-radius:6px; padding:9px 12px; }
+.mapping-warning:empty { display:none; }
+.bridge-status { padding:12px; border:1px solid #e0e7ef; border-radius:8px; background:#f9fbff; }
+.bridge-status h3 { margin:0; font-size:14px; }
+.bridge-status p { margin:8px 0; line-height:1.6; overflow-wrap:anywhere; }
+.muted { color:#52687d; font-size:13px; }
+.channel-origin { font-size:11px; color:#52687d; margin:0 0 8px; }
+#module-filter { max-width:260px; }
+@media(max-width:650px) { .bridge-mappings { grid-template-columns:1fr; } }
