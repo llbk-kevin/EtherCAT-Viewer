@@ -33,3 +33,7 @@ cd EtherCAT-Viewer
 6. [开发、打包与发布](docs/06-开发、打包与发布.md)
 
 第三方依赖的许可与对应源码见 [第三方组件与许可](THIRD-PARTY-NOTICES.md)。
+
+## 五、外部参考资料
+
+- [中瑞 E1682 TCP/IP 通信协议](reference/中瑞E1682-TCP-IP通信协议.md)
