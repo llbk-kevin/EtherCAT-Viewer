@@ -3,6 +3,8 @@ from pathlib import Path
 import sys
 
 root = Path(SPECPATH)
+sys.path.insert(0, str(root))
+from viewer import __version__
 notices = [(str(file), "licenses/SOEM") for file in (root / "licenses").glob("*.txt")]
 notices.append((str(Path(sys.base_prefix) / "LICENSE.txt"), "licenses/Python"))
 for distribution in distributions():
@@ -29,5 +31,5 @@ analysis.binaries = [
 ]
 exe = EXE(
     PYZ(analysis.pure), analysis.scripts, analysis.binaries, analysis.datas, [],
-    name="EtherCAT-Viewer-v0.1.0-windows-x64", console=True, upx=False,
+    name=f"EtherCAT-Viewer-v{__version__}-windows-x64", console=True, upx=False,
 )

@@ -15,6 +15,7 @@ def worker():
 @pytest.mark.parametrize("fault", ["wkc", "state"])
 def test_bus_fault_invalidates_sample_and_clears_nonzero_command(fault):
     w = worker()
+    w.settings["faults"]["consecutive"] = 1
     now = time.perf_counter_ns()
     w.lease[:] = [1, now]
     w.connection, w.owner = "OP", 1
@@ -31,7 +32,7 @@ def test_bus_fault_invalidates_sample_and_clears_nonzero_command(fault):
     assert sample["ao"] == [None] * 4 and not sample["ao_valid"]
     assert w.values == [0] * 4
     assert w.connection == "FAULT" and not w.owner
-    assert w.zero == "输出状态未知"
+    assert "无法确认" in w.zero
     bus.close.assert_called_once()
 
 def test_expired_controller_lease_cancels_wave_and_output():

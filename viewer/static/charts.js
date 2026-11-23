@@ -53,6 +53,7 @@ class SharedCharts {
   constructor(label) {
     this.label = label;
     this.plots = [];
+    this.observers = [];
     this.rows = [];
     this.start = 0;
     this.origin = null;
@@ -64,7 +65,18 @@ class SharedCharts {
     this.lastDraw = 0;
   }
 
-  attach(box, index) {
+  reset() {
+    for (const observer of this.observers) observer.disconnect();
+    for (const plot of this.plots) plot.destroy();
+    this.plots = [];
+    this.observers = [];
+    this.rows = [];
+    this.start = 0;
+    this.origin = null;
+    this.follow();
+  }
+
+  attach(box, index, output = false) {
     const plot = new uPlot({
       width: Math.max(1, box.clientWidth), height: 125,
       legend: {show: false},
@@ -74,7 +86,7 @@ class SharedCharts {
              {stroke: "#354b64", size: 39, grid: {stroke: "#e1e9f0"}}],
       cursor: {drag: {x: true, y: false, setScale: false, dist: 6}},
       series: [{}, {stroke: traceColors[index % 4], width: 1.5, spanGaps: false,
-                    ...(index < 4 ? {paths: uPlot.paths.stepped({align: 1})} : {})}],
+                    ...(output ? {paths: uPlot.paths.stepped({align: 1})} : {})}],
       hooks: {setSelect: [u => {
         if (u.select.width < 6) return;
         const left = u.posToVal(u.select.left, "x");
@@ -90,10 +102,12 @@ class SharedCharts {
     };
     plot.over.addEventListener("wheel", wheel, {passive: false});
     plot.over.addEventListener("dblclick", () => this.follow());
-    new ResizeObserver(() => {
+    const observer = new ResizeObserver(() => {
       plot.setSize({width: Math.max(1, box.clientWidth), height: 125});
       this.schedule();
-    }).observe(box);
+    });
+    observer.observe(box);
+    this.observers.push(observer);
     this.plots.push(plot);
   }
 
@@ -138,6 +152,7 @@ class SharedCharts {
   }
 
   schedule() {
+    if (this.visible && !this.visible()) return;
     if (this.frame !== null) return;
     this.frame = requestAnimationFrame(now => {
       this.frame = null;
@@ -151,6 +166,7 @@ class SharedCharts {
   }
 
   draw() {
+    if (this.visible && !this.visible()) return;
     if (this.following) {
       this.to = Math.max(this.width, this.rows.at(-1)?.x ?? 0);
       this.from = this.to - this.width;

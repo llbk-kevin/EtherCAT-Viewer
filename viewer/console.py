@@ -2,7 +2,9 @@ import ctypes
 from datetime import datetime
 import json
 import os
-from threading import Event
+import sys
+from queue import Queue, Full
+from threading import Event, Thread, Lock
 
 from .paths import data_root
 
@@ -22,12 +24,37 @@ def log_stop(event, **fields):
         os.fsync(stream.fileno())
 
 
+_console_queue = Queue(maxsize=256)
+_console_thread = None
+_console_lock = Lock()
+
+
+def _console_writer():
+    while True:
+        message = _console_queue.get()
+        try:
+            print(message, flush=True)
+        except (OSError, ValueError):
+            pass
+
+
 def console_message(message):
-    try:
-        print(message, flush=True)
-    except OSError:
-        # The console can become unwritable while Windows is closing it.
-        pass
+    # Windows Mark/QuickEdit 可阻塞 WriteConsole，不允许拖住 Web 事件循环。
+    global _console_thread
+    if os.name == "nt" and sys.stdout is not None and sys.stdout.isatty():
+        with _console_lock:
+            if _console_thread is None:
+                _console_thread = Thread(target=_console_writer,daemon=True,name="console-output")
+                _console_thread.start()
+        try:
+            _console_queue.put_nowait(str(message))
+        except Full:
+            pass
+    else:
+        try:
+            print(message, flush=True)
+        except (OSError, ValueError):
+            pass
 
 
 class BusConsole:
@@ -81,6 +108,20 @@ class ConsoleStop:
         attached = (ctypes.c_uint32 * 1)()
         if not kernel.GetConsoleProcessList(attached, len(attached)):
             return self
+
+        # CONIN$ 不受调用者标准句柄重定向影响。
+        kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+                                      ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+        kernel.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+        if handle not in (None, ctypes.c_void_p(-1).value):
+            kernel.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+            kernel.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            mode = ctypes.c_uint32()
+            if kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel.SetConsoleMode(handle, (mode.value | 0x80) & ~0x40)
+            kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel.CloseHandle(handle)
 
         callback = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint32)
         kernel.SetConsoleCtrlHandler.argtypes = [callback, ctypes.c_int]

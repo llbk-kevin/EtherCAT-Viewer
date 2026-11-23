@@ -4,8 +4,10 @@ from pathlib import Path
 import subprocess
 import sys
 
+from viewer import __version__
+
 ROOT = Path(__file__).resolve().parent
-VERSION = "v0.1.0"
+VERSION = f"v{__version__}"
 ASSET = f"EtherCAT-Viewer-{VERSION}-windows-x64.exe"
 
 

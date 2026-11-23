@@ -9,7 +9,8 @@ import sys
 from threading import Event, Thread
 import webbrowser
 
-from viewer.console import ConsoleStop, log_stop
+from viewer.console import ConsoleStop, console_message, log_stop
+from viewer.settings import Settings
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -42,7 +43,30 @@ def open_dashboard(requested):
               file=sys.stderr, flush=True)
 
 
-async def serve(server, requested, listener):
+def minimize_console():
+    if sys.platform == "win32":
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 6)
+
+
+def console_keys(requested):
+    if sys.platform != "win32" or sys.stdin is None or not sys.stdin.isatty():
+        return
+    import msvcrt
+    while not requested.wait(0.1):
+        if msvcrt.kbhit():
+            key = msvcrt.getwch()
+            if key in ("\x00", "\xe0"):
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+            elif key.lower() == "o":
+                open_dashboard(requested)
+
+
+async def serve(server, requested, listener, startup=None):
+    startup = startup or {"open_browser": True, "minimized": False}
     run = asyncio.create_task(server.serve(sockets=[listener]))
     announced = False
     try:
@@ -52,10 +76,14 @@ async def serve(server, requested, listener):
                 break
             if server.started and not server.should_exit and not announced:
                 announced = True
-                print(f"服务已就绪 · {DASHBOARD_URL}", flush=True)
-                print("按 Ctrl+C 或点击 × 停止服务。", flush=True)
-                print("等待连接 EtherCAT。", flush=True)
-                Thread(target=open_dashboard, args=(requested,), daemon=True).start()
+                console_message(f"服务已就绪 · {DASHBOARD_URL}")
+                console_message("按 O 打开管理网页；按 Ctrl+C 或点击 × 停止服务。")
+                console_message("等待连接 EtherCAT。")
+                if startup["open_browser"]:
+                    Thread(target=open_dashboard, args=(requested,), daemon=True).start()
+                Thread(target=console_keys, args=(requested,), daemon=True).start()
+                if startup["minimized"]:
+                    minimize_console()
             await asyncio.wait({run}, timeout=0.05)
         await run
     finally:
@@ -103,12 +131,12 @@ def main():
                 print(f"无法监听 {HOST}:{PORT}。请检查端口是否已被占用。{exc}", file=sys.stderr)
                 return 1
 
-            print("正在启动 EtherCAT Viewer 后端…", flush=True)
+            console_message("正在启动 EtherCAT Viewer 后端…")
             server = uvicorn.Server(uvicorn.Config("viewer.server:app", host=HOST, port=PORT,
                                                    log_level="warning", use_colors=False, access_log=False,
                                                    timeout_graceful_shutdown=1))
             try:
-                asyncio.run(serve(server, requested, listener))
+                asyncio.run(serve(server, requested, listener, Settings().data["startup"]))
             except KeyboardInterrupt:
                 reason = "ctrl_c"
             log_stop("service_stop", reason=reason, started=server.started)

@@ -1,241 +1,118 @@
 "use strict";
-const el = id => document.getElementById(id);
-const charts = new SharedCharts(el("time-window"));
-const channelCards = [];
-let socket, token, lastSample, sequence = 0, pending = false;
-let state = {}, lastFrame = 0, pendingPeriod = false;
-
-function channelCard(channel, output) {
-  const name = (output ? "AO" : "AI") + channel;
-  const card = document.createElement("article");
-  card.className = "chart-card";
-  card.style.setProperty("--trace", traceColors[channel - 1]);
-  card.innerHTML = '<div class="chart-head"><strong>' + name + '</strong>' +
-    '<output class="reading" aria-label="' + name + ' 电压">—</output></div>' +
-    '<div class="plot" aria-label="' + name + ' 电压波形"></div>';
-  if (output) {
-    const form = document.createElement("form");
-    form.className = "generator";
-    form.innerHTML = '<div class="generator-form">' +
-      '<label>波形<select aria-label="' + name + ' 波形" id="shape-' + channel + '">' +
-      '<option value="dc">直流</option><option value="sine">正弦</option>' +
-      '<option value="triangle">三角</option><option value="square">方波</option></select></label>' +
-      '<label><span class="voltage-label">电压 / V</span><input aria-label="' + name + ' 电压或峰值" ' +
-      'id="voltage-' + channel + '" type="number" min="-10" max="10" step="any" required value="0"></label>' +
-      '<label>频率 / Hz<input aria-label="' + name + ' 频率" id="frequency-' + channel + '" ' +
-      'type="number" min="0.01" max="25" step="any" required value="0.2"></label></div>' +
-      '<p class="wave-info"></p><div class="group"><button class="apply">应用</button>' +
-      '<button class="stop" type="button">停波清零</button></div>';
-    const [shape, voltage, frequency] = form.querySelectorAll("select,input");
-    form.oninput = () => renderGenerator(form, canOutput());
-    form.onsubmit = event => {
-      event.preventDefault();
-      const value = voltage.valueAsNumber;
-      if (shape.value === "dc") command("set_output", {channel, voltage: value});
-      else command("wave", {channel, shape: shape.value, peak: value, frequency: frequency.valueAsNumber});
-    };
-    form.querySelector(".stop").onclick = () => command("stop_wave", {channel});
-    card.append(form);
+const el=id=>document.getElementById(id);
+const charts=new SharedCharts(el("time-window"));
+let socket,token,lastSample,state={},pending=0,lastFrame=0,activePage=null,channelLayout="",aoCount=0,commandEpoch=0;
+const pageScroll=new Map();
+history.scrollRestoration="manual";
+const channelCards=[];
+const notifications=new Notifications();
+const settingsPanel=new SettingsPanel(requestSetting,showMessage,canManage);
+const bridgePanel=new BridgePanel(command,settingsPanel,showMessage);
+let selectedAdapter=null,adapterEdited=false,lastOperationError="",claimPending=false;
+const diagnosticCharts=new DiagnosticCharts(()=>activePage==="diagnostics"&&!document.hidden);
+charts.visible=()=>activePage==="control"&&!document.hidden;
+function text(id,value){const node=el(id);if(node&&node.textContent!==value)node.textContent=value;}
+function showMessage(message,error=false){notifications.show(message,error);}
+function format(value,digits=3,unit=" ms"){return Number.isFinite(value)?value.toFixed(digits)+unit:"—";}
+function rows(id,values){const body=el(id),key=JSON.stringify(values);if(body.dataset.key===key)return;body.dataset.key=key;body.replaceChildren();for(const valuesRow of values){const row=body.insertRow();for(const value of valuesRow)row.insertCell().textContent=value;}}
+function selectPage(name){if(!["ethercat","control","bridge","calibration","diagnostics","system"].includes(name))name="ethercat";
+  const changed=name!==activePage;
+  if(changed&&activePage)pageScroll.set(activePage,window.scrollY);
+  activePage=name;
+  for(const node of document.querySelectorAll("[data-view]"))node.hidden=node.dataset.view!==name;
+  el("output-actions").hidden=name!=="control"&&name!=="bridge";el("control-hint").hidden=name!=="control";
+  for(const button of document.querySelectorAll("[data-page]")){const selected=button.dataset.page===name;button.classList.toggle("selected",selected);if(selected){button.setAttribute("aria-current","page");requestAnimationFrame(()=>revealInStrip(document.querySelector(".main-nav"),button));}else button.removeAttribute("aria-current");}
+  if(name==="calibration")settingsPanel.revealModule();if(name==="bridge")bridgePanel.revealSelected();charts.schedule();diagnosticCharts.update();render();
+  if(changed)window.scrollTo({top:pageScroll.get(name)??0,behavior:"instant"});
+}
+function navigatePage(name){if(location.hash!=="#"+name)history.pushState(null,"","#"+name);selectPage(name);}
+for(const button of document.querySelectorAll("[data-page]"))button.onclick=()=>navigatePage(button.dataset.page);
+window.addEventListener("hashchange",()=>selectPage(location.hash.slice(1)));
+const revealNavigation=()=>requestAnimationFrame(()=>revealInStrip(document.querySelector(".main-nav"),document.querySelector(".main-nav .selected")));
+new ResizeObserver(revealNavigation).observe(document.querySelector(".main-nav"));window.addEventListener("pageshow",revealNavigation);document.fonts.ready.then(revealNavigation);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden){charts.schedule();diagnosticCharts.update();}});
+function canManage(){return token&&socket?.readyState===WebSocket.OPEN&&state.controller;}
+function canOutput(index){return canManage()&&state.connection==="OP"&&state.ready&&state.output_owners?.[index]==="web"&&!pending;}
+function ownerLabel(owner){if(owner==="web")return"网页控制";if(!owner||owner==="locked")return"锁定";const card=state.bridge?.cards.find(c=>c.id===owner);return"TCP · "+(card?.name||owner)+(card?.controller?"":"（待客户端）");}
+function alarmLabel(flags,valid){if(!flags)return"等待数据";const labels=[];for(const[key,label]of[["underrange","欠量程"],["overrange","超量程"],["error","通道错误"],["sync_error","同步错误"],["invalid","数据无效"]])if(flags[key])labels.push(label);if(flags.status&0x6043&&!labels.length)labels.push("模块报告异常");return labels.join("、")||(valid?"正常":"暂无有效数据");}
+function channelCard(channel,output,source){const name=(output?"AO":"AI")+channel,card=document.createElement("article");card.className="chart-card";card.style.setProperty("--trace",traceColors[(channel-1)%4]);card.dataset.module=source?String(source.slave_position):"";
+  card.innerHTML='<div class="chart-head"><strong></strong><output class="reading">—</output></div><p class="channel-origin"></p><p class="channel-state"></p><div class="plot"></div><p class="engineering-reading"></p>';
+  card.querySelector("strong").textContent=name;card.querySelector(".reading").setAttribute("aria-label",name+" 电压");card.querySelector(".channel-origin").textContent=source?.label||"等待真实模块";
+  if(output){const actions=document.createElement("div");actions.className="group channel-actions";actions.innerHTML='<button class="arm-channel">允许网页控制</button><button class="lock-channel">清零并锁定本通道</button>';actions.querySelector(".arm-channel").onclick=()=>command("arm",{channels:[channel]});actions.querySelector(".lock-channel").onclick=()=>command("lock_channel",{channels:[channel]});card.append(actions);
+    const form=document.createElement("form");form.className="generator";form.innerHTML='<div class="generator-form"><label>波形<select class="shape"><option value="dc">直流</option><option value="sine">正弦波</option><option value="triangle">三角波</option><option value="square">方波</option></select></label><label><span class="voltage-label">目标电压 / V</span><input class="voltage" type="number" step="any" min="-10" max="10" required value="0"></label><label>频率 / Hz<input class="frequency" type="number" min="0.01" step="any" required value="0.2"></label></div><label class="engineering-mode" hidden>直流输入单位<select class="input-unit"><option value="voltage">电压 / V</option><option value="engineering">物理量</option></select></label><p class="wave-info"></p><div class="group"><button class="apply primary">应用</button><button class="stop" type="button">停波清零</button></div>';
+    for(const node of form.querySelectorAll("input,select"))node.setAttribute("aria-label",name+" "+({shape:"波形",voltage:"目标电压或峰值",frequency:"频率","input-unit":"直流输入单位"}[node.className]||"参数"));
+    form.oninput=()=>{form.dataset.dirty="yes";renderGenerator(form,channel-1);};
+    form.onsubmit=async e=>{e.preventDefault();const shape=form.querySelector(".shape").value,value=form.querySelector(".voltage").valueAsNumber,frequency=form.querySelector(".frequency").valueAsNumber;
+      const args={channel};let action;if(shape==="dc"){action="set_output";args[form.querySelector(".input-unit").value==="engineering"?"engineering":"voltage"]=value;}else{action="wave";Object.assign(args,{shape,peak:value,frequency});}
+      if(await command(action,args))form.dataset.dirty="";
+    };form.querySelector(".stop").onclick=async()=>{if(await command("stop_wave",{channel})){form.dataset.dirty="";form.querySelector(".shape").value="dc";form.querySelector(".voltage").value=0;}};card.append(form);
   }
-  el(output ? "outputs" : "inputs").append(card);
-  channelCards.push(card);
-  charts.attach(card.querySelector(".plot"), channelCards.length - 1);
+  el(output?"outputs":"inputs").append(card);channelCards.push(card);charts.attach(card.querySelector(".plot"),channelCards.length-1,output);
 }
-
-for (const output of [true, false]) {
-  for (let channel = 1; channel <= 4; channel++) channelCard(channel, output);
+function ensureChannels(){const known=!!state.fingerprint,channels=known?state.channels:{ai:[],ao:[]};if(!channels)return;const key=JSON.stringify([state.fingerprint,channels]);if(key===channelLayout)return;channelLayout=key;charts.reset();channelCards.length=0;el("outputs").replaceChildren();el("inputs").replaceChildren();aoCount=channels.ao.length;
+  for(const output of[true,false])channels[output?"ao":"ai"].forEach((source,i)=>channelCard(i+1,output,source));
+  const filter=el("module-filter"),previous=filter.value;filter.replaceChildren(new Option("全部模块",""));for(const[position,name]of new Map([...channels.ai,...channels.ao].map(c=>[String(c.slave_position),c.module])))filter.add(new Option("从站 "+position+" · "+name,position));filter.value=[...filter.options].some(o=>o.value===previous)?previous:"";filter.onchange();
 }
-el("zoom-in").onclick = () => charts.zoom(0.5);
-el("zoom-out").onclick = () => charts.zoom(2);
-el("follow").onclick = () => charts.follow();
-
-function canOutput() {
-  return token && state.controller && state.connection === "OP" && state.armed && !pending;
+el("module-filter").onchange=()=>{channelCards.forEach(c=>c.hidden=!!el("module-filter").value&&c.dataset.module!==el("module-filter").value);el("outputs-title").hidden=!channelCards.slice(0,aoCount).some(c=>!c.hidden);el("inputs-title").hidden=!channelCards.slice(aoCount).some(c=>!c.hidden);el("scope-empty").hidden=channelCards.some(c=>!c.hidden);charts.schedule();};
+function renderGenerator(form,index){const shape=form.querySelector(".shape"),voltage=form.querySelector(".voltage"),frequency=form.querySelector(".frequency"),unit=form.querySelector(".input-unit"),dc=shape.value==="dc",period=state.period_ms||10,limit=Math.min(100,250/period),enabled=canOutput(index);
+  const ident=state.channels?.ao[index]?.id,profile=state.channel_profiles?.[ident]||{},engineering=!!profile.engineering?.enabled;
+  form.querySelector(".engineering-mode").hidden=!engineering||!dc;if(!engineering||!dc)unit.value="voltage";
+  voltage.min=unit.value==="engineering"?"":dc?"-10":"0";voltage.max=unit.value==="engineering"?"":"10";frequency.max=String(limit);
+  form.querySelector(".voltage-label").textContent=unit.value==="engineering"?"目标 / "+profile.engineering.unit:dc?"目标电压 / V":"峰值 / V";
+  for(const node of form.querySelectorAll("input,select,button"))node.disabled=!enabled;frequency.disabled=!enabled||dc;
+  const points=1000/period/frequency.valueAsNumber,info=form.querySelector(".wave-info");info.classList.toggle("warning",!dc&&points<20);info.textContent=dc?"物理目标 −10 至 +10 V":"约 "+(Number.isFinite(points)?points.toFixed(1):"—")+" 点 / 波形周期"+(points<20?" · 台阶明显":"");
+  if(!form.dataset.dirty&&document.activeElement?.closest("form")!==form){const wave=state.wave_tasks?.[index];if(wave&&wave.shape!=="table"){shape.value=wave.shape;frequency.value=wave.frequency;voltage.value=wave.peak;}else if(!wave){shape.value="dc";if(unit.value==="voltage"&&Number.isFinite(state.targets?.[index]))voltage.value=state.targets[index].toFixed(5);}}
 }
-function text(id, value) {
-  const node = el(id);
-  if (node.textContent !== value) node.textContent = value;
+function renderDiagnostics(){const online=state.connection==="OP",stats=state.timing||{};text("target-metric",(state.period_ms||10)+" ms");text("interval-metric",online?format(stats.interval?.latest):"—");text("roundtrip-metric",online?format(stats.roundtrip?.latest):"—");text("rate-metric",online?format(stats.update_hz,1," Hz"):"—");text("wkc",online?(state.wkc??"—")+" / "+(state.expected_wkc??"—"):"—");text("error-metric",String(state.errors??0));text("missed-metric",String(state.missed??0));text("fault-detail",[state.reason,state.zero,state.health==="TOLERATING"?"容错中："+state.bad_count+" 次，"+format(state.bad_duration_ms):"",!online&&state.last_error?"上次异常："+state.last_error:""].filter(Boolean).join(" · "));
+  el("fault-detail").classList.toggle("error",state.health==="FAULT"||state.health==="TOLERATING");
+  rows("timing-details",[["实际周期间隔",stats.interval],["主站收发耗时",stats.roundtrip]].map(([name,s])=>[name,...["latest","median","p95","max"].map(k=>format(s?.[k])),s?.count??0]));
+  text("viewer-drops","原始源遗漏 "+(state.source_drops??0)+" · 工作进程网页遥测遗漏 "+(state.dropped??0)+" · 本页推送遗漏 "+(state.viewer_drops??0));
+  const parent=el("input-alarms"),channels=state.channels?.ai||[],key=JSON.stringify([channels,lastSample?.flags,lastSample?.valid,state.hardware_details?.map(d=>d.sync_error)]);if(parent.dataset.key!==key){parent.dataset.key=key;parent.replaceChildren();channels.forEach((c,i)=>{const p=document.createElement("div");p.className="channel-alarm"+(lastSample?.valid[i]?"":" warning");p.textContent=c.label+" · "+alarmLabel(lastSample?.flags[i],lastSample?.valid[i]);parent.append(p);});for(const module of state.hardware_details||[]){if(module.kind!=="ao")continue;const p=document.createElement("div");p.className="channel-alarm"+(module.sync_error?" warning":"");p.textContent=module.name+" 输出模块 · "+(module.sync_error?"同步错误":module.sync_error===false?"最近同步检查正常":"同步状态未知")+"（低频读取）";parent.append(p);}}
 }
-function showMessage(message, error = false) {
-  text("message", message);
-  el("message").hidden = !message;
-  el("message").classList.toggle("error", error);
-}
-function format(value, digits = 3, unit = " ms") {
-  return Number.isFinite(value) ? value.toFixed(digits) + unit : "—";
-}
-function setRows(id, rows) {
-  const body = el(id);
-  const key = JSON.stringify(rows);
-  if (body.dataset.key === key) return;
-  body.dataset.key = key;
-  body.replaceChildren();
-  for (const row of rows) {
-    const tr = body.insertRow();
-    for (const value of row) tr.insertCell().textContent = value;
+function render(){ensureChannels();const connected=state.connection==="OP",managed=canManage(),transport=socket?.readyState===WebSocket.OPEN,operating=state.operation?.state==="running";
+  text("connection",!transport?"管理离线":connected?(state.health==="TOLERATING"?"容错中":"已连接 · OP"):state.connection==="CONNECTING"?"正在连接":state.connection==="FAULT"?"通信故障":"未连接");el("connection-item").classList.toggle("online",connected&&transport&&state.health!=="TOLERATING");el("connection-item").classList.toggle("offline",!transport||(!connected&&state.connection!=="CONNECTING"));el("connection-item").classList.toggle("connecting",transport&&(state.connection==="CONNECTING"||state.health==="TOLERATING"));
+  text("station-count",connected?(state.devices?.length||0)+" 从站":"— 从站");text("tcp-count","TCP "+(state.bridge?.cards||[]).reduce((n,c)=>n+c.connections,0));
+  text("management-state",!transport?"管理离线":managed?"本页管理":"本页只读");const manager=el("management-button");manager.disabled=!!managed||!transport||claimPending;manager.classList.toggle("is-manager",!!managed);manager.setAttribute("aria-label",managed?"本页管理，AO 写权限独立授权":transport?"本页只读，点击切换管理到本页":"管理离线");manager.title=managed?"本页拥有管理身份；AO 写权限仍按通道独立授权":"点击取得管理身份，原管理页会转为只读";
+  el("refresh").disabled=!transport||!!pending;el("adapters").disabled=!managed||!!pending||operating;
+  if(state.interface&&![...el("adapters").options].some(o=>o.value===state.interface))el("adapters").add(new Option("当前接口 · "+(state.nic?.items?.find(i=>i.interface===state.interface)?.name||state.interface),state.interface));
+  if(!adapterEdited&&!selectedAdapter)selectedAdapter=state.interface||settingsPanel.config?.hardware.interface||"";
+  if(selectedAdapter&&[...el("adapters").options].some(o=>o.value===selectedAdapter))el("adapters").value=selectedAdapter;
+  if(settingsPanel.config){
+    const saved=settingsPanel.config.hardware.interface;
+    const name=[...el("adapters").options].find(option=>option.value===saved)?.dataset.name||state.nic?.items?.find(item=>item.interface===saved)?.name;
+    text("saved-adapter",saved?"已保存网卡："+(name?name+" · ":"")+saved:"尚未保存网卡");
   }
-}
-
-function renderGenerator(form, enabled) {
-  const [shape, voltage, frequency] = form.querySelectorAll("select,input");
-  const dc = shape.value === "dc";
-  const period = state.period_ms || 10;
-  const limit = Math.min(100, 250 / period);
-  voltage.min = dc ? "-10" : "0";
-  frequency.max = String(limit);
-  form.querySelector(".voltage-label").textContent = dc ? "电压 / V" : "峰值 / V";
-  shape.disabled = voltage.disabled = form.querySelector(".apply").disabled = form.querySelector(".stop").disabled = !enabled;
-  frequency.disabled = !enabled || dc;
-  const points = 1000 / period / frequency.valueAsNumber;
-  const info = form.querySelector(".wave-info");
-  info.classList.toggle("warning", !dc && points < 20);
-  info.textContent = dc ? "−10 至 +10 V" : "约 " +
-    (Number.isFinite(points) && points > 0 ? points.toFixed(1) : "—") +
-    " 点 / 波形周期" + (points < 20 ? " · 台阶明显" : "");
-}
-
-function renderDiagnostics(online) {
-  const stats = state.timing || {};
-  const period = state.period_ms || 10;
-  text("target-metric", period + " ms");
-  text("interval-metric", online ? format(stats.interval?.latest) : "—");
-  text("roundtrip-metric", online ? format(stats.roundtrip?.latest) : "—");
-  text("rate-metric", online ? format(stats.update_hz, 1, " Hz") : "—");
-  text("wkc", online ? (state.wkc ?? "—") + " / " + (state.expected_wkc ?? "—") : "—");
-  text("error-metric", String(state.errors ?? 0));
-  text("missed-metric", String(state.missed ?? 0));
-  text("bus-summary", online ? (state.devices?.length ?? 0) + " 个从站处于 OP · 看门狗 " + state.watchdog_ms + " ms" : "等待实机连接");
-  const lastWkc = !online && state.wkc != null ? " · 最后 WKC " + state.wkc + "/" + state.expected_wkc : "";
-  const lastError = state.last_error && state.last_error !== state.reason ? "上次异常 " + state.last_error : "";
-  text("fault-detail", [...new Set([state.reason, state.zero, lastError].filter(Boolean))].join(" · ") + lastWkc);
-  setRows("timing-details", [["实际周期间隔", stats.interval], ["主站收发耗时", stats.roundtrip]]
-    .map(([name, series]) => [name, ...["latest", "median", "p95", "max"].map(key => format(series?.[key])), series?.count ?? 0]));
-  text("viewer-drops", "工作进程遥测遗漏 " + (state.dropped ?? 0) + " · 本页推送遗漏 " + (state.viewer_drops ?? 0));
-  setRows("devices", (state.devices || []).map(d => [d.name, d.vendor + " / " + d.product, d.revision, d.state, d.al_status]));
-  if (el("input-details").parentElement.open) text("input-details", online && lastSample ? lastSample.raw.map((v, i) =>
-    "AI" + (i + 1) + " " + (v ?? "—") + " · " + (JSON.stringify(lastSample.flags[i]) ?? "—")).join(" | ") : "输入状态未提供");
-  const mapping = el("mapping-text");
-  mapping.hidden = !Object.keys(state.mapping || {}).length;
-  if (!mapping.hidden && mapping.parentElement.open) text("mapping-text", JSON.stringify(state.mapping, null, 2));
-}
-
-function render() {
-  const online = token && state.connection === "OP";
-  const controller = token && state.controller;
-  text("connection", online ? "已连接 · OP" : pending && state.connection === "CONNECTING" ? "连接中" : "掉线");
-  el("connection").classList.toggle("online", Boolean(online));
-  text("claim", controller ? "本页控制中" : state.controller_busy ? "另一页面控制中" : "取得控制权");
-  el("claim").disabled = !token || state.controller_busy || pending;
-  el("connect").disabled = !controller || online || !el("adapters").value || pending;
-  el("disconnect").disabled = !controller || !online || pending;
-  el("refresh").disabled = !token || online || pending;
-  el("adapters").disabled = !token || online || pending;
-  el("arm").disabled = !controller || !online || !state.ready || state.armed || pending;
-  el("zero").disabled = !controller || !online || pending;
-  text("lock", online && state.armed ? "输出已解锁" : "输出已锁定");
-  el("record").disabled = !controller || (!online && !state.recording) || pending;
-  text("record", state.recording ? "停止记录" : "开始记录");
-  el("export").hidden = !state.export;
-  el("period-form").querySelector("button").disabled = !controller || pending;
-  if (!pendingPeriod && document.activeElement !== el("period")) el("period").value = state.period_ms || 10;
-  const samples = online && lastSample?.session === state.session ? lastSample : null;
-  channelCards.forEach((card, index) => {
-    const value = index < 4 ? samples?.ao[index] : samples?.ai[index - 4];
-    card.querySelector(".reading").textContent = format(value, 3, " V");
-    if (index < 4) renderGenerator(card.querySelector(".generator"), canOutput());
+  const selected=el("adapters").value;el("retry").disabled=!managed||!!pending||operating||!selected||(connected&&selected===state.interface);el("disconnect").disabled=!managed||!!pending||operating||["DISCONNECTED",undefined].includes(state.connection);el("retry").classList.toggle("selected",connected&&selected===state.interface);el("disconnect").classList.toggle("selected",state.connection==="DISCONNECTED");
+  text("operation",operating?state.operation.message:"");el("operation").hidden=!operating;
+  if(state.operation?.state==="failed"&&state.operation.id!==lastOperationError){lastOperationError=state.operation.id;showMessage(state.operation.message,true);}
+  el("global-zero").disabled=!managed;
+  const owners=state.output_owners||[],free=owners.some(x=>x==="locked");el("arm").disabled=!managed||!state.ready||!free||!!pending;el("record").disabled=!managed||(!connected&&!state.recording)||!!pending;text("record",state.recording?"停止记录":"开始记录");el("export").hidden=!state.export;
+  const devices=state.devices?.length?state.devices:(settingsPanel.config?.topology.devices||[]);rows("devices",devices.map((d,i)=>[i+1,d.name,connected?({"0x08":"运行 OP","0x04":"安全运行 SAFEOP","0x02":"预运行 PREOP","0x01":"初始化 INIT"}[d.state]||"状态异常"):"未连接 · 上次识别",connected?(d.al_status==="0x0000"?"正常":"设备错误，详见诊断"):"—"]));
+  const topologyKey=JSON.stringify(devices.map(d=>d.name));if(el("topology").dataset.key!==topologyKey){el("topology").dataset.key=topologyKey;el("topology").replaceChildren();devices.forEach((d,i)=>{if(i){const arrow=document.createElement("span");arrow.className="topology-arrow";arrow.textContent="→";arrow.setAttribute("aria-hidden","true");el("topology").append(arrow);}const box=document.createElement("div");box.className="slave-node";const link=document.createElement("button");link.type="button";link.className="module-link";link.dataset.module=moduleIdentity(i+1,d.name);link.setAttribute("aria-label","查看从站 "+(i+1)+" "+d.name+" 模块与通道");link.append(modulePicture(d.name));const label=document.createElement("strong");label.textContent="从站 "+(i+1)+" · "+d.name;link.append(label);link.onclick=()=>{settingsPanel.selectModule(link.dataset.module,{focus:true});navigatePage("calibration");};box.append(link,infoButton(({EK1100:"EtherCAT 耦合器，连接专用网卡与 E-bus 模块。",EL3104:"四路差分模拟量电压输入，±10 V；点击产品图查看通道和滤波配置。",EL4134:"四路模拟量电压输出，±10 V；点击产品图查看校准与失联策略。"}[d.name]||"以当前扫描结果识别的从站。")));el("topology").append(box);});}
+  text("bus-summary",connected?(devices.length+" 个从站"):devices.length?"上次确认的拓扑":"等待连接");
+  const sample=connected&&lastSample?.session===state.session?lastSample:null;
+  channelCards.forEach((card,index)=>{const output=index<aoCount,i=output?index:index-aoCount,value=output?sample?.ao[i]:sample?.ai[i],source=state.channels?.[output?"ao":"ai"]?.[i],profile=state.channel_profiles?.[source?.id];card.querySelector(".reading").textContent=format(value,3," V");
+    card.querySelector("strong").textContent=(output?"AO":"AI")+(i+1)+(profile?.name?" · "+profile.name:"");
+    card.querySelector(".channel-state").textContent=output?ownerLabel(owners[i]):alarmLabel(sample?.flags[i],sample?.valid[i]);
+    const engineering=output?sample?.ao_engineering?.[i]:sample?.engineering?.[i];card.querySelector(".engineering-reading").textContent=profile?.engineering?.enabled?format(engineering,3," "+profile.engineering.unit):"";
+    if(output){card.querySelector(".arm-channel").disabled=!managed||!state.ready||owners[i]!=="locked"||!!pending;card.querySelector(".lock-channel").disabled=!managed||owners[i]!=="web"||!!pending;renderGenerator(card.querySelector("form"),i);}
   });
-  renderDiagnostics(online);
+  const alarmCount=lastSample?.valid?.filter(v=>!v).length||0;text("alarm-count",alarmCount?String(alarmCount):"");renderDiagnostics();bridgePanel.render(state,!!pending,settingsPanel.config);settingsPanel.render(state);const dirty=settingsPanel.store.dirty||bridgePanel.dirty;text("config-warning",dirty?"有未应用修改":"");el("config-warning").hidden=!dirty;
 }
+async function refresh(){try{const response=await fetch("/api/adapters",{signal:AbortSignal.timeout(10000)}),data=await response.json();if(!response.ok)throw Error(data.detail);const select=el("adapters"),selected=selectedAdapter??(state.interface||select.value||settingsPanel.config?.hardware.interface);select.replaceChildren(new Option(data.items.length?"请选择专用有线网卡":"未发现物理有线网卡",""));for(const item of data.items){const option=new Option([item.name,item.status==="Up"?"链路已连接":"链路未连接",item.speed,!item.interface?"Npcap 不可用":""].filter(Boolean).join(" · "),item.interface||"");option.dataset.name=item.name;option.disabled=item.status!=="Up"||!item.interface;select.add(option);if(item.interface===selected)option.selected=true;}if(data.error)showMessage(data.error,true);}catch(error){showMessage(error.message,true);}render();}
+async function requestSetting(action,args={}){if(!canManage())throw Error("本页为只读，请先切换管理到本页");const response=await fetch("/api/commands",{method:"POST",headers:{"content-type":"application/json","x-viewer-session":token},body:JSON.stringify({id:crypto.randomUUID(),action,args}),signal:AbortSignal.timeout(action==="apply_settings"?45000:18000)});const data=await response.json();if(!response.ok||!data.ok){const error=Error(typeof data.detail==="string"?data.detail:data.detail?.message||data.error||"命令失败");error.paths=data.detail?.paths||[];throw error;}if(data.result)state={...state,...data.result};return data;}
+async function command(action,args={}){if(!canManage()||pending&&action!=="zero")return;if(action==="zero")commandEpoch++;const epoch=commandEpoch;pending++;render();try{const data=await requestSetting(action,args);if(epoch!==commandEpoch)return;const messages={zero:"已确认全路零目标并锁定",connect:"正在连接所选接口",disconnect:"接口已断开",arm:"网页控制权限已更新",lock_channel:"本通道已清零并锁定",set_output:"输出目标已应用",wave:"波形已启动",stop_wave:"已停波并清零",record_start:"已开始记录",record_stop:"记录已停止",bridge_start:"已开始监听",bridge_stop:"已停止发布并清零",bridge_authorize:"已允许 TCP 控制本卡输出"};if(messages[action])showMessage(messages[action]);return data;}catch(error){if(epoch!==commandEpoch)return;if(action==="bridge_save")throw error;showMessage(error.name==="TimeoutError"?"请求超时，请查看后台操作状态后重试。":error.message,true);}finally{pending--;render();}}
+el("refresh").onclick=refresh;el("adapters").onchange=()=>{selectedAdapter=el("adapters").value;adapterEdited=true;render();};el("retry").onclick=async()=>{const result=await command("connect",{interface:el("adapters").value});if(result){adapterEdited=false;selectedAdapter=el("adapters").value;}};el("disconnect").onclick=()=>command("disconnect");
+el("management-button").onclick=()=>{if(!canManage())commandClaim();};
+async function commandClaim(){if(!token||claimPending)return;claimPending=true;render();try{const response=await fetch("/api/commands",{method:"POST",headers:{"content-type":"application/json","x-viewer-session":token},body:JSON.stringify({id:crypto.randomUUID(),action:"claim",args:{takeover:true}}),signal:AbortSignal.timeout(5000)});const data=await response.json();if(!response.ok||!data.ok)throw Error(typeof data.detail==="string"?data.detail:data.error||"管理身份切换失败");state=data.result;render();}catch(error){showMessage(error.message,true);}finally{claimPending=false;render();}}
+el("global-zero").onclick=()=>command("zero");el("arm").onclick=()=>command("arm",{channels:(state.output_owners||[]).map((o,i)=>o==="locked"?i+1:null).filter(Boolean)});el("record").onclick=()=>command(state.recording?"record_stop":"record_start");
+el("zoom-in").onclick=()=>charts.zoom(.5);el("zoom-out").onclick=()=>charts.zoom(2);el("follow").onclick=()=>charts.follow();
+function connectWebSocket(){let resume="";try{resume=sessionStorage.getItem("viewer-session")||"";}catch{}socket=new WebSocket("ws://"+location.host+"/ws?resume="+encodeURIComponent(resume));socket.onmessage=event=>{try{lastFrame=performance.now();const packet=JSON.parse(event.data);if(packet.kind==="hello"){token=packet.token;try{sessionStorage.setItem("viewer-session",token);}catch{}refresh();if(!settingsPanel.config)settingsPanel.load();}
+    if(state.session!==packet.status.session){lastSample=null;charts.reset();}state=packet.status;ensureChannels();if(packet.samples?.length){lastSample=packet.samples.at(-1);charts.append(packet.samples);}render();}catch(error){showMessage("页面状态处理失败："+error.message,true);}};socket.onclose=()=>{token=null;render();setTimeout(connectWebSocket,1000);};socket.onerror=()=>{};}
+setInterval(()=>{if(socket?.readyState===WebSocket.OPEN){if(token&&performance.now()-lastFrame>3000)socket.close();else socket.send("heartbeat");}},500);
+const tooltip=el("tooltip");function showTip(node){tooltip.textContent=node.dataset.help;tooltip.hidden=false;const r=node.getBoundingClientRect();tooltip.style.left=Math.max(8,Math.min(innerWidth-340,r.left))+"px";tooltip.style.top=Math.min(innerHeight-160,r.bottom+8)+"px";node.setAttribute("aria-describedby","tooltip");}
+document.addEventListener("mouseover",e=>{if(e.target.closest(".info"))showTip(e.target.closest(".info"));});document.addEventListener("mouseout",e=>{if(e.target.closest(".info"))tooltip.hidden=true;});document.addEventListener("focusin",e=>{if(e.target.closest(".info"))showTip(e.target.closest(".info"));});document.addEventListener("focusout",()=>tooltip.hidden=true);document.addEventListener("click",e=>{if(e.target.closest(".info")){e.preventDefault();showTip(e.target.closest(".info"));}else tooltip.hidden=true;});
+window.addEventListener("pagehide",()=>{if(socket?.readyState===WebSocket.OPEN)socket.send("pagehide");});
+selectPage(location.hash.slice(1));connectWebSocket();
 
-async function refresh() {
-  try {
-    const response = await fetch("/api/adapters");
-    const data = await response.json();
-    if (!response.ok) throw Error(data.detail);
-    const select = el("adapters");
-    const previous = select.value;
-    select.replaceChildren(new Option(data.items.length ? "请选择有线网卡" : "未发现物理有线网卡", ""));
-    for (const item of data.items) {
-      const option = new Option([item.name, item.status === "Up" ? "已连接" : "链路未连接",
-        item.speed, item.interface ? "" : "Npcap 不可用"].filter(Boolean).join(" · "), item.interface || "");
-      option.disabled = item.status !== "Up" || !item.interface;
-      select.add(option);
-      if (!option.disabled && option.value === previous) option.selected = true;
-    }
-    if (data.error) showMessage(data.error, true);
-  } catch (error) { showMessage(error.message, true); }
-  render();
-}
-
-async function command(action, args = {}) {
-  if (!token || pending) return;
-  pending = true;
-  render();
-  try {
-    const response = await fetch("/api/commands", {method: "POST",
-      headers: {"content-type": "application/json", "x-viewer-session": token},
-      body: JSON.stringify({id: String(++sequence), action, args})});
-    const data = await response.json();
-    if (!response.ok || !data.ok) throw Error(data.error || data.detail || "命令失败");
-    if (data.result) state = {...state, ...data.result};
-    if (action === "set_period") {
-      pendingPeriod = false;
-      el("period").value = state.period_ms;
-    }
-    showMessage(action === "zero" ? "已清零并锁定输出" : "");
-  } catch (error) { showMessage(error.message, true); }
-  finally { pending = false; render(); }
-}
-
-el("refresh").onclick = refresh;
-el("adapters").onchange = render;
-el("claim").onclick = () => command("claim");
-el("connect").onclick = () => command("connect", {interface: el("adapters").value});
-for (const action of ["disconnect", "arm", "zero"]) el(action).onclick = () => command(action);
-el("record").onclick = () => command(state.recording ? "record_stop" : "record_start");
-el("period").oninput = () => { pendingPeriod = true; };
-el("period-form").onsubmit = event => {
-  event.preventDefault();
-  command("set_period", {period_ms: el("period").valueAsNumber});
-};
-
-function connectWebSocket() {
-  socket = new WebSocket("ws://" + location.host + "/ws");
-  socket.onmessage = event => {
-    lastFrame = performance.now();
-    const packet = JSON.parse(event.data);
-    if (packet.kind === "hello") {
-      token = packet.token;
-      // A service restart breaks the timestamp epoch and sample sequence.
-      if (charts.rows.length && (!packet.samples.length ||
-          packet.samples.at(-1).seq < charts.rows.at(-1).seq)) {
-        charts.rows = [];
-        charts.start = 0;
-        charts.origin = null;
-        lastSample = null;
-        charts.follow();
-      }
-      if (!el("adapters").value) refresh();
-    }
-    state = packet.status;
-    if (packet.samples.length) {
-      lastSample = packet.samples.at(-1);
-      charts.append(packet.samples);
-    }
-    render();
-  };
-  socket.onclose = () => {
-    token = null;
-    state = {...state, connection: "DISCONNECTED", reason: "网页与本地服务的连接已中断"};
-    render();
-    setTimeout(connectWebSocket, 1000);
-  };
-}
-setInterval(() => {
-  if (socket?.readyState === WebSocket.OPEN) {
-    if (token && performance.now() - lastFrame > 3000) socket.close();
-    else if (state.controller) socket.send("heartbeat");
-  }
-}, 500);
-render();
-connectWebSocket();
+document.addEventListener("keydown",event=>{if(event.key==="Escape")tooltip.hidden=true;});
