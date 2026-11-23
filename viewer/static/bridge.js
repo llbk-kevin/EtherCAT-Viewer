@@ -3,19 +3,23 @@ class BridgePanel {
   constructor(post,settings,notify){
     this.post=post;this.settings=settings;this.notify=notify;this.state={};this.channels={ai:[],ao:[]};this.addresses=["127.0.0.1"];this.draft=null;this.base=null;this.selected=null;try{this.selected=sessionStorage.getItem("viewer-bridge-card");}catch{}this.pages=new Map();this.quantityDrafts=new Map();this.dirty=false;
     const on=(id,fn)=>document.getElementById(id).onclick=fn;
-    on("bridge-reload",()=>{this.draft=structuredClone(this.remote);this.base=structuredClone(this.remote);this.quantityDrafts.clear();this.conflict=false;this.dirty=false;this.draw();});
+    on("bridge-reload",()=>{this.draft=structuredClone(this.remote);this.base=structuredClone(this.remote);this.quantityDrafts.clear();this.conflict=false;this.dirty=false;this.saveFeedback="";this.draw();});
     on("bridge-verify",()=>{this.draft.fingerprint=this.state.fingerprint;this.changed();});
     on("bridge-save",async()=>{
       if(!this.checkQuantities())return;
       const invalid=document.querySelector("#bridge-config :invalid");if(invalid){invalid.reportValidity();return;}
-      const response=await this.post("bridge_save",{config:this.draft,base_config:this.base});
-      if(response?.ok){this.remote=structuredClone(response.config);this.base=structuredClone(response.config);this.draft=structuredClone(response.config);this.dirty=false;this.conflict=false;this.draw();}
+      this.saving=true;this.saveFeedback="";
+      try{
+        const response=await this.post("bridge_save",{config:this.draft,base_config:this.base});
+        if(response?.ok){this.remote=structuredClone(response.config);this.base=structuredClone(response.config);this.draft=structuredClone(response.config);this.dirty=false;this.conflict=false;this.saveFeedback="卡配置已保存";this.draw();}
+      }catch(error){this.saveFeedback=error.name==="TimeoutError"?"保存请求超时，请核对后台值后重试。":"卡配置保存失败："+error.message;}
+      finally{this.saving=false;this.renderControls();}
     });
     on("bridge-start",()=>this.post("bridge_start"));on("bridge-stop",()=>this.post("bridge_stop"));
     fetch("/api/bridge/network").then(r=>r.json()).then(d=>{this.addresses=d.addresses||this.addresses;if(this.draft&&!this.dirty)this.draw();}).catch(()=>{});
   }
   nextPort(profile){const used=new Set(this.draft.cards.map(c=>c.port));let port=profile==="legacy"?6000:7000;while(used.has(port)&&port<65535)port++;return port;}
-  changed(){this.dirty=this.quantityDrafts.size>0||!settingSame(this.draft,this.base);this.renderControls();}
+  changed(){this.saveFeedback="";this.dirty=this.quantityDrafts.size>0||!settingSame(this.draft,this.base);this.renderControls();}
   checkQuantities(cardId){const entry=[...this.quantityDrafts.values()].find(d=>!cardId||d.card===cardId);if(!entry)return true;this.selected=entry.card;this.draw();const input=document.querySelector('#bridge-card-panel [data-field="'+entry.kind.toUpperCase()+' 数量"]');input?.focus();input?.reportValidity();return false;}
   revealSelected(){requestAnimationFrame(()=>revealInStrip(document.getElementById("bridge-tabs"),document.getElementById("tab-"+this.selected)));}
   add(profile,mapped){
@@ -126,8 +130,13 @@ class BridgePanel {
     document.getElementById("bridge-save").disabled=!permitted||!this.draft||!this.dirty||this.conflict;
     document.getElementById("bridge-start").disabled=!permitted||!this.state.ready||this.dirty||!this.draft?.cards.some(c=>c.enabled&&!active.has(c.id));
     document.getElementById("bridge-stop").disabled=!permitted||!this.state.bridge?.active;
-    const label=this.conflict?"后台同时修改了卡配置，草稿保留；请放弃草稿后重新核对。":this.dirty?"卡配置有未保存修改":this.draft?.fingerprint&&this.state.fingerprint&&this.draft.fingerprint!==this.state.fingerprint?"拓扑已改变，请核对映射":"";
-    document.getElementById("bridge-config-state").textContent=label;
+    const status=document.getElementById("bridge-config-state");
+    let label=this.saveFeedback||"";
+    if(this.conflict)label="后台同时修改了卡配置，草稿保留；请放弃草稿后重新核对。";
+    else if(this.saving)label="保存中";
+    else if(this.dirty)label=label||"卡配置有未保存修改";
+    else if(this.draft?.fingerprint&&this.state.fingerprint&&this.draft.fingerprint!==this.state.fingerprint)label="拓扑已改变，请核对映射";
+    if(status.textContent!==label)status.textContent=label;
   }
   render(state,pending,config){
     this.state=state;this.pending=pending;this.channels=state.fingerprint?state.channels:(config?.topology?.channels||this.channels);

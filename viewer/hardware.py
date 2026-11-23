@@ -220,7 +220,7 @@ class Hardware:
         for slave, _ in self.ao_modules:
             from .settings import module_settings
             position = self.master.slaves.index(slave)+1
-            target = module_settings(configuration,position,slave.name).get("watchdog_ms",configuration["hardware"]["watchdog_ms"]) if configuration else 100
+            target = module_settings(configuration,position,slave.name).get("watchdog_ms",600) if configuration else 100
             value = slave.get_watchdog("processdata")
             if abs(value-target) > 1:
                 slave.set_watchdog("processdata", target)
@@ -308,7 +308,7 @@ class Hardware:
             for module_index, (slave, _) in enumerate(modules):
                 position = self.master.slaves.index(slave)+1
                 module = module_settings(configuration,position,slave.name)
-                selection = module.get("filter",h["filter"])
+                selection = module.get("filter","current")
                 parameter = 0x1C33 if kind == "ai" else 0x1C32
                 supported = read_int(slave, parameter, 4, 2)
                 minimum = read_int(slave, parameter, 5, 4)
@@ -477,14 +477,13 @@ class Hardware:
                 value = dict(action="hold" if action == 2 else "zero" if is_zero else "value",
                              voltage=0 if action == 2 or is_zero else target)
         except Exception as exc:
-            error = str(exc)
-            if field == "sync":
-                self.parameter_modes[ident] = None
+            error = f"参数读取失败（{type(exc).__name__}）：{str(exc) or '设备未返回有效参数，请检查超时和通信状态'}"
         finally:
             self.master.sdo_read_timeout = previous
         result = dict(path=path,value=value,time_ns=time.perf_counter_ns(),
                       duration_ms=(time.perf_counter_ns()-started)/1e6,error=error)
-        self.parameter_values[path] = value
+        if error is None:
+            self.parameter_values[path] = value
         modes = list(self.parameter_modes.values())
         self.parameter_values["hardware/sync"] = modes[0] if modes and all(m == modes[0] for m in modes) else "mixed"
         return result

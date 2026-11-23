@@ -190,7 +190,11 @@ class Service:
             login_changed = config["startup"]["login"] != before["startup"]["login"]
             operation = dict(id=secrets.token_hex(8),state="running",message="正在应用所选参数",
                              paths=[c["path"] for c in plan["changes"]])
-            self.operation = operation
+            # 普通字段仅由调用行显示进度，避免启动开关触发全局连接提示。
+            if plan["mode"] == "reconnect":
+                self.operation = operation
+            persistence_only = all(c["path"][0] == "startup" or c["path"][:2] == ["bridge","cards"]
+                                   for c in plan["changes"])
             try:
                 if plan["mode"]=="reconnect":
                     self.critical_zero()
@@ -207,6 +211,8 @@ class Service:
                     await self.bridge_request("configure",dict(config=config))
                     result = await self.bridge_request("connect",dict(interface=config["hardware"]["interface"]))
                     self.status.update(result or {})
+                elif persistence_only:
+                    pass
                 elif plan["mode"]=="live":
                     touched_worker = True
                     result = await self.bridge_request("runtime_config",dict(config=config))
@@ -222,7 +228,7 @@ class Service:
                 saved = await asyncio.to_thread(self.settings.save,config,before["revision"])
                 self.set_bridge_configuration(saved["bridge"])
                 operation.update(state="done",message="参数已应用并回读" if plan["mode"]=="reconnect" else "参数已保存")
-                self.journal.log("control","逐项应用参数",paths=operation["paths"],mode=plan["mode"],revision=saved["revision"])
+                self.journal.log("control","逐项应用参数",paths=operation["paths"],mode=plan["mode"],config_revision=saved["revision"])
                 return dict(config=saved,noop=False,mode=plan["mode"])
             except Exception as exc:
                 if touched_worker:
@@ -440,9 +446,10 @@ class Service:
                     stamp = time.time()*1000
                     fault = answer["severity"] in ("warning","error")
                     clip = dict(before=self.history.query(stamp-5000,stamp,2000)) if fault else {}
-                    self.journal.log(answer["category"],answer["message"],answer["severity"],nic=self.nic,**clip,**details)
+                    record = self.journal.log(answer["category"],answer["message"],answer["severity"],nic=self.nic,
+                                              fragment_state="collecting" if fault else "none",**clip,**details)
                     if fault:
-                        self.fault_clips.append((stamp+5000,answer["message"]))
+                        self.fault_clips.append((stamp+5000,record["event_id"],self.journal.generation))
                     continue
                 future = self.pending.get(answer["id"])
                 if future is not None and not future.done():
@@ -497,10 +504,10 @@ class Service:
             self.console.update(self.status)
             if self.status["connection"] not in ("OP","CONNECTING") and self.recording:
                 self.record_stop()
-            for stamp,message in list(self.fault_clips):
+            for stamp,ident,generation in list(self.fault_clips):
                 if time.time()*1000 >= stamp:
-                    self.journal.log("runtime","故障后片段",related=message,after=self.history.query(stamp-5000,stamp,2000))
-                    self.fault_clips.remove((stamp,message))
+                    self.journal.update(ident,generation,fragment_state="complete",after=self.history.query(stamp-5000,stamp,2000))
+                    self.fault_clips.remove((stamp,ident,generation))
             if batches or now-self.last_broadcast >= .25:
                 self.last_broadcast = now
                 for token,queue in tuple(self.clients.items()):
@@ -531,6 +538,9 @@ async def lifespan(app):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks,return_exceptions=True)
+        for stamp,ident,generation in service.fault_clips:
+            service.journal.update(ident,generation,fragment_state="incomplete",
+                                   after=service.history.query(stamp-5000,time.time()*1000,2000))
         if service.worker.is_alive():
             log_stop("worker_stop_timeout",worker_pid=service.worker.pid,zero="unknown")
             service.worker.terminate()
@@ -598,7 +608,21 @@ async def history(request:Request,start:float|None=None,end:float|None=None,limi
 @app.get("/api/events")
 async def events(request:Request,category:str="",after:int=0):
     journal = request.app.state.service.journal
-    return dict(events=journal.list(category,after),error=journal.error,dropped=journal.dropped)
+    return dict(events=journal.list(category,after),generation=journal.generation,error=journal.error,dropped=journal.dropped)
+
+@app.get("/api/events/{event_id}")
+async def event_detail(event_id:str,request:Request,generation:str|None=None):
+    journal = request.app.state.service.journal
+    generation = generation or journal.generation
+    try:
+        detail = await asyncio.to_thread(journal.detail,event_id,generation)
+        return dict(event=detail,generation=generation)
+    except KeyError as exc:
+        raise HTTPException(404,str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409,str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(503,str(exc)) from exc
 
 @app.get("/api/diagnostics/export")
 async def export_diagnostics(request:Request):
@@ -608,8 +632,9 @@ async def export_diagnostics(request:Request):
         with zipfile.ZipFile(output,"w",zipfile.ZIP_DEFLATED) as z:
             z.writestr("诊断状态.json",json.dumps(service.status_for(""),ensure_ascii=False,indent=2))
             z.writestr("诊断历史.json",json.dumps(service.history.query(time.time()*1000-1800000,limit=20000),ensure_ascii=False))
-            for p in service.journal.folder.glob("events*.jsonl"):
-                z.write(p,"日志/"+p.name)
+            with service.journal.lock:
+                for p in service.journal.folder.glob("events*.jsonl"):
+                    z.write(p,"日志/"+p.name)
         return output.getvalue()
     return Response(await asyncio.to_thread(build),media_type="application/zip",headers={"Content-Disposition":"attachment; filename=ethercat-diagnostics.zip"})
 
@@ -640,6 +665,10 @@ async def commands(command:Command,request:Request):
             extra.update(await service.apply_settings(args["changes"],args.get("approved")))
         elif action == "open_config_directory":
             await asyncio.to_thread(open_config_directory)
+        elif action == "clear_diagnostics":
+            # 不接收路径参数，也不清空连续诊断历史、CSV 或退出日志。
+            extra["diagnostics"] = await asyncio.to_thread(service.journal.clear)
+            service.fault_clips.clear()
         elif action == "set_period":
             changes = [dict(path=["hardware","period_ms"],base=service.settings.data["hardware"]["period_ms"],value=args["period_ms"])]
             plan = service.settings_plan(changes)
@@ -699,7 +728,7 @@ async def commands(command:Command,request:Request):
                         await asyncio.to_thread(service.settings.save,data,data["revision"])
                 if action=="arm":
                     service.manual_lock = False
-        if action not in ("claim","calibration_two_point"):
+        if action not in ("claim","calibration_two_point","clear_diagnostics","apply_settings"):
             labels = {"connect":"连接接口","disconnect":"断开接口","zero":"全部清零并锁定","arm":"允许网页控制","lock_channel":"清零并锁定通道","set_output":"应用输出目标","wave":"启动波形","stop_wave":"停波清零","record_start":"开始记录","record_stop":"停止记录","bridge_save":"保存虚拟卡配置","bridge_start":"开始监听虚拟卡","bridge_stop":"停止虚拟卡","bridge_authorize":"授权 TCP 控制","apply_settings":"应用参数","config_save":"保存配置","open_config_directory":"打开配置文件夹"}
             service.journal.log("control",labels.get(action,"管理操作"),operation=action,channels=args.get("channels"))
         result = dict(id=command.id,ok=True,result=service.status_for(token),**extra)

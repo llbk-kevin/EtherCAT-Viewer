@@ -11,7 +11,7 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const vm=require('node:vm');
 const {DraftStore,valueAt,same}=require('./viewer/static/drafts.js');
-const context={settingValueAt:valueAt,settingSame:same};
+const context={settingValueAt:valueAt,settingSame:same,document:{activeElement:null,body:{}}};
 vm.runInNewContext(fs.readFileSync('./viewer/static/settings.js','utf8')+'\nglobalThis.Panel=SettingsPanel;',context);
 function setup(){
   const server={startup:{open_browser:false},hardware:{period_ms:10}};
@@ -49,6 +49,18 @@ assert.equal(panel.config.startup.open_browser,true);assert.equal(c.busy,false);
 assert.equal(panel.store.entry(['hardware','period_ms']).draft,20);
 const request=panel.commands.at(-1).args.changes;assert.equal(request.length,1);
 assert.equal(request[0].path.join('/'),'startup/open_browser');assert.equal(request[0].base,false);
+""")
+
+
+def test_instant_save_restores_keyboard_focus_without_stealing_new_focus():
+    run_js(r"""
+const {panel,c}=setup();let focused=0;
+c.input={isConnected:true,disabled:false,getClientRects:()=>[{}],focus:()=>{focused++;context.document.activeElement=c.input;}};
+context.document.activeElement=c.input;
+panel.paintControl=c=>{c.input.disabled=c.busy;if(c.busy)context.document.activeElement=context.document.body;};
+await panel.applyInstant(c,true);assert.equal(focused,1);assert.equal(context.document.activeElement,c.input);
+const send=panel.send,other={};panel.send=async(...args)=>{context.document.activeElement=other;return send(...args);};
+await panel.applyInstant(c,false);assert.equal(focused,1);assert.equal(context.document.activeElement,other);
 """)
 
 
@@ -94,6 +106,48 @@ def test_readonly_page_cannot_submit_instant_settings():
     run_js(r"""
 const {panel,c}=setup();panel.managed=()=>false;await panel.applyInstant(c,true);
 assert.equal(panel.commands.length,0);assert.equal(c.entry.draft,false);
+""")
+
+
+def test_regular_field_reports_success_and_retry_in_the_field_only():
+    run_js(r"""
+const {panel,server}=setup(),path=['hardware','period_ms'],entry=panel.store.edit(path,12);
+const c={entry,definition:{path},busy:false};
+panel.valid=()=>true;
+const notifications=[];panel.notify=(...args)=>notifications.push(args);
+let fail=true;
+panel.send=async(action,args)=>{
+  assert.equal(args.changes.length,1);
+  if(action==='preview_settings')return{plan:{mode:'offline',changes:args.changes}};
+  if(fail)throw Error('参数校验失败');
+  server.hardware.period_ms=args.changes[0].value;return{config:server};
+};
+await panel.apply(c);assert.match(c.failure,/参数校验失败/);assert.equal(c.entry.draft,12);
+fail=false;await panel.apply(c);assert.equal(c.failure,'');assert.equal(c.applied,true);
+assert.equal(panel.config.hardware.period_ms,12);assert.equal(c.entry.dirty,false);
+assert.deepEqual(notifications,[]);
+""")
+
+
+def test_two_point_record_renders_coefficients_from_saved_measurements():
+    run_js(r"""
+const result=context.measurementText({type:'two_point',x1:0,y1:-0.01,x2:1,y2:1.99});
+assert.match(result,/增益 2 · 偏移 -0\.01 V/);
+assert.doesNotMatch(result,/undefined|NaN/);
+""")
+
+
+def test_unsupported_import_clears_previously_selected_configuration():
+    run_js(r"""
+const {panel}=setup(),nodes=new Map();
+context.document={getElementById:id=>{if(!nodes.has(id))nodes.set(id,{});return nodes.get(id);}};
+let message='';panel.notify=text=>{message=text;};
+const select=version=>panel.importFile({target:{files:[{text:async()=>JSON.stringify({
+  version,hardware:{interface:'test'},bridge:{cards:[]}
+})}]}});
+await select(3);assert.equal(panel.importDraft.version,3);assert.equal(nodes.get('import-preview').hidden,false);
+await select(2);assert.equal(panel.importDraft,null);assert.equal(nodes.get('import-preview').hidden,true);
+assert.match(message,/配置版本必须为 3/);
 """)
 
 

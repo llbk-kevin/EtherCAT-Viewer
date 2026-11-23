@@ -2,11 +2,49 @@
 import assert from "node:assert/strict";
 const json=(page,url)=>page.evaluate(async u=>{const r=await fetch(u);if(!r.ok)throw Error("读取失败 "+r.status);return r.json();},url);
 const cards=async page=>(await json(page,"/api/config")).config.bridge.cards;
+export async function diagnosticFragmentDetails(page){
+  await page.click("[data-page=diagnostics]");
+  const events=(await json(page,"/api/events")).events;
+  const event=events.slice(-100).reverse().find(e=>e.fragment_state!=="none");
+  assert.ok(event,"需要本地已保存的故障片段供只读验收");
+  const row='#event-list details[data-event-id="'+event.event_id+'"]';
+  await page.evaluate(()=>{window.__detailFetch=window.fetch;window.__detailFailOnce=true;window.fetch=async(...args)=>{if(String(args[0]).startsWith('/api/events/')&&window.__detailFailOnce){window.__detailFailOnce=false;return new Response(JSON.stringify({detail:'隔离的读取失败验收'}),{status:503,headers:{'content-type':'application/json'}});}return window.__detailFetch(...args);};});
+  try{
+    await page.click(row+' summary');
+    await page.waitForFunction(selector=>document.querySelector(selector)?.textContent.includes("加载失败"),row);
+    await page.click(row+' button:text-is("重试加载")');
+    await page.waitForFunction(selector=>document.querySelector(selector)?.querySelectorAll('.fault-fragment canvas').length===4,row);
+    const result=await page.evaluate(selector=>{const row=document.querySelector(selector);window.__fragmentCanvas=row.querySelector('canvas');return{open:row.open,text:row.querySelector('.fault-fragment').textContent};},row);
+    assert.ok(result.open);assert.match(result.text,/个显示样本/);
+    // 多次列表刷新后，已展开详情及图表实例必须保留。
+    await page.evaluate(()=>{window.__eventPolls=0;const original=window.fetch;window.fetch=async(...args)=>{if(args[0]==='/api/events')window.__eventPolls++;return original(...args);};});
+    await page.waitForFunction(()=>window.__eventPolls>=2);
+    assert.ok(await page.evaluate(selector=>document.querySelector(selector)?.open&&document.querySelector(selector).querySelector('canvas')===window.__fragmentCanvas,row));
+    return{eventId:event.event_id,charts:4,retry:true,instancePreserved:true};
+  }finally{await page.evaluate(()=>{window.fetch=window.__detailFetch;delete window.__detailFetch;});}
+}
+
+export async function clearIsolatedDiagnostics(page,expectedOrigin){
+  assert.ok(expectedOrigin&&expectedOrigin!=="http://127.0.0.1:8765","仅允许调用者明确指定的隔离服务");
+  assert.equal(await page.evaluate(()=>location.origin),expectedOrigin);
+  assert.equal((await json(page,"/api/status")).connection,"DISCONNECTED");
+  await page.click("[data-page=diagnostics]");
+  const before=await json(page,"/api/events");
+  await page.click("#clear-diagnostics");
+  await page.waitForSelector("#clear-diagnostics-dialog[open]");
+  await page.click('#clear-diagnostics-dialog button[value="cancel"]');
+  assert.equal((await json(page,"/api/events")).generation,before.generation);
+  await page.click("#clear-diagnostics");await page.click("#confirm-clear-diagnostics");
+  await page.waitForFunction(()=>document.getElementById("event-list").textContent.includes("诊断日志已清空"));
+  const after=await json(page,"/api/events");
+  assert.notEqual(before.generation,after.generation);assert.equal(after.events.length,0);
+  return{cleared:true,generationChanged:true};
+}
 export async function mixedCardCycles(page,rounds=20){
   await page.click("[data-page=bridge]");
   const baseline=await cards(page),count=baseline.length;
   const panel="#bridge-card-panel";
-  const save=async()=>{await page.click("#bridge-save");await page.waitForFunction(()=>document.getElementById("bridge-save").disabled&&!document.getElementById("bridge-config-state").textContent.includes("未保存"));};
+  const save=async()=>{await page.click("#bridge-save");await page.waitForFunction(()=>document.getElementById("bridge-config-state").textContent==="卡配置已保存");};
   const action=text=>page.click(panel+' button:text-is("'+text+'")');
   const selected=()=>page.evaluate(()=>document.querySelector("#bridge-card-panel")?.dataset.card);
   for(let i=0;i<rounds;i++){
@@ -110,11 +148,20 @@ export async function moduleCardsAndDrafts(page){
 }
 
 export async function notificationHistoryInteractions(page){
-  await page.click('[data-page="bridge"]');await page.click('#notification-toggle');
+  await page.click('[data-page="control"]');
+  assert.equal(await page.evaluate(()=>{window.__testedZero=document.querySelector('.global-zero');return document.querySelectorAll('.global-zero').length===1&&!!window.__testedZero.getClientRects().length;}),true);
+  await page.click('[data-page="bridge"]');
+  assert.equal(await page.evaluate(()=>window.__testedZero===document.querySelector('main > #output-actions .global-zero')&&!!window.__testedZero.getClientRects().length),true);
+  await page.click('#notification-toggle');
   assert.equal(await page.evaluate(()=>document.querySelector('#notification-history').matches(':popover-open')),true);
-  const overlap=await page.evaluate(()=>{const a=document.querySelector('#notification-history').getBoundingClientRect(),b=[...document.querySelectorAll('.global-zero')].find(n=>n.getBoundingClientRect().width)?.getBoundingClientRect();return !!b&&a.left<b.right&&a.right>b.left&&a.top<b.bottom&&a.bottom>b.top;});assert.equal(overlap,false);
+  const overlap=await page.evaluate(()=>{const a=document.querySelector('#notification-history').getBoundingClientRect(),b=document.querySelector('.global-zero').getBoundingClientRect();return a.left<b.right&&a.right>b.left&&a.top<b.bottom&&a.bottom>b.top;});assert.equal(overlap,false);
   await page.click('#notification-history-close');assert.equal(await page.evaluate(()=>document.activeElement.id),"notification-toggle");
   await page.click('#notification-toggle');await page.click('[data-page="system"]');assert.equal(await page.evaluate(()=>document.querySelector('#notification-history').matches(':popover-open')),false);
+  for(const name of ['system','ethercat','calibration','diagnostics']){
+    await page.click('[data-page="'+name+'"]');
+    assert.equal(await page.evaluate(()=>window.__testedZero.getClientRects().length),0);
+  }
+  await page.evaluate(()=>{delete window.__testedZero;});
   await page.click('#notification-toggle');await page.press('#notification-toggle',"Escape");assert.equal(await page.evaluate(()=>document.querySelector('#notification-history').matches(':popover-open')),false);
   return{closeButton:true,outsideDismiss:true,escape:true,safetyActionVisible:true};
 }
@@ -127,8 +174,10 @@ export async function instantSwitchInteractions(page){
   try{
     await page.click(row+' .switch');await page.waitForFunction(()=>document.querySelector('[data-path="startup/open_browser"]').getAttribute('aria-busy')==='true');
     assert.equal(await page.evaluate(s=>document.querySelector(s+' input').disabled,row),true);
+    assert.equal(await page.evaluate(s=>document.querySelector(s+' .switch-status').textContent,row),'保存中');
     await page.waitForFunction(()=>document.querySelector('[data-path="startup/open_browser"]').getAttribute('aria-busy')==='false');
     assert.equal((await json(page,"/api/config")).config.startup.open_browser,!original);
+    assert.equal(await page.evaluate(s=>document.querySelector(s+' .switch-status').textContent,row),original?'已关闭':'已开启');
     assert.deepEqual(await page.evaluate(()=>window.__instantMutations),[]);
     // 注入请求失败；必须恢复后台确认值，并保留明确的重试入口。
     await page.evaluate(()=>{window.__failInstant=true;window.fetch=async(...args)=>{if(window.__failInstant&&args[0]==='/api/commands'&&JSON.parse(args[1]?.body||'{}').action==='apply_settings'){window.__failInstant=false;return new Response(JSON.stringify({detail:'即时保存回归注入'}),{status:503,headers:{'content-type':'application/json'}});}return window.__instantOriginal(...args);};});
@@ -163,8 +212,8 @@ export async function invalidCardCountDraft(page){
   const id=await page.evaluate(()=>document.querySelector('#bridge-card-panel').dataset.card);await page.click('#tab-'+before[0].id);await page.click('#tab-'+id);
   assert.equal(await page.evaluate(()=>document.querySelector('#bridge-card-panel [data-field="AI 数量"]').value),"0");
   await page.fill(panel+' [data-field="AI 数量"]',"4");await page.press(panel+' [data-field="AI 数量"]',"Tab");await page.click('#bridge-save');
-  await page.waitForFunction(()=>document.querySelector('#bridge-save').disabled&&!document.querySelector('#bridge-config-state').textContent.includes('未保存'));assert.equal((await cards(page)).find(c=>c.id===id).ai.length,4);
-  await page.click(panel+' button:text-is("删除本卡")');await page.click('#bridge-save');await page.waitForFunction(()=>document.querySelector('#bridge-save').disabled&&!document.querySelector('#bridge-config-state').textContent.includes('未保存'));assert.deepEqual(await cards(page),before);
+  await page.waitForFunction(()=>document.querySelector('#bridge-config-state').textContent==='卡配置已保存');assert.equal((await cards(page)).find(c=>c.id===id).ai.length,4);
+  await page.click(panel+' button:text-is("删除本卡")');await page.click('#bridge-save');await page.waitForFunction(()=>document.querySelector('#bridge-config-state').textContent==='卡配置已保存');assert.deepEqual(await cards(page),before);
   return{invalidValuePreserved:true,saveBlocked:true,repairedAndRestored:true};
 }
 
@@ -176,6 +225,6 @@ export async function selectedNavigationVisible(page){
   await page.focus(selector);await page.press(selector,'Enter');
   await page.waitForFunction(id=>document.activeElement.id==='module-tab-'+id,id);
   assert.equal(await page.evaluate(()=>{const strip=document.querySelector('#module-tabs'),selected=strip.querySelector('[aria-selected=true]'),a=strip.getBoundingClientRect(),b=selected.getBoundingClientRect();return b.left>=a.left&&b.right<=a.right;}),true);
-  await page.press('[id="module-tab-'+id+'"]','Tab');assert.equal(await page.evaluate(()=>document.activeElement.id==='import-reference'||!!document.activeElement.closest('.module-config,.channel-profile')),true);
+  await page.press('[id="module-tab-'+id+'"]','Tab');assert.equal(await page.evaluate(()=>!!document.activeElement.closest('.module-config,.channel-profile')),true);
   return{directUrlVisible:true,selectedModuleVisible:true,keyboardFocusTransferred:true};
 }

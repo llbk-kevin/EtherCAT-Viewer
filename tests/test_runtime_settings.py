@@ -34,40 +34,76 @@ def test_unreachable_calibrated_zero_is_rejected():
         validate(data)
 
 
-def test_settings_atomic_revision_backup_and_migration(tmp_path,monkeypatch):
+def test_settings_atomic_revision_backup_and_native_bridge(tmp_path,monkeypatch):
     monkeypatch.setattr("viewer.settings.settings_path",lambda:tmp_path/"settings.json")
     card = preset(catalog(),"signature","legacy")
-    (tmp_path/"bridge.json").write_text(json.dumps(card),encoding="utf-8")
     store = Settings()
-    assert store.data["bridge"]["cards"][0]["id"] == card["cards"][0]["id"]
     data = deepcopy(store.data)
+    data["bridge"] = card
     data["faults"]["consecutive"] = 17
     saved = store.save(data,0)
     assert saved["revision"] == 1
-    assert Settings().data["faults"]["consecutive"] == 17
+    reloaded = Settings()
+    assert reloaded.data["faults"]["consecutive"] == 17
+    assert reloaded.data["bridge"]["cards"] == card["cards"]
     saved["startup"]["open_browser"] = False
     store.save(saved,1)
     assert json.loads((tmp_path/"settings.backup.json").read_text(encoding="utf-8"))["revision"] == 1
     with pytest.raises(ValueError,match="其他页面"):
         store.save(data,0)
     (tmp_path/"settings.json").write_text("损坏",encoding="utf-8")
-    assert Settings().error and not Settings().data["startup"]["unattended"]
+    loaded = Settings()
+    assert loaded.error and not loaded.data["startup"]["auto_connect"]
+
+
+def test_bridge_configuration_only_loads_from_settings(tmp_path, monkeypatch):
+    monkeypatch.setattr("viewer.settings.settings_path", lambda: tmp_path/"settings.json")
+    legacy = tmp_path/"bridge.json"
+    legacy.write_text(json.dumps(preset(catalog(), "signature", "legacy")), encoding="utf-8")
+    loaded = Settings()
+    assert not loaded.error and loaded.data["bridge"]["cards"] == []
+    assert not loaded.path.exists()
+
+
+def test_version_2_configuration_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr("viewer.settings.settings_path", lambda: tmp_path/"settings.json")
+    data = defaults()
+    data["version"] = 2
+    with pytest.raises(ValueError, match="配置版本必须为 3"):
+        validate(data)
+    (tmp_path/"settings.json").write_text(json.dumps(data), encoding="utf-8")
+    loaded = Settings()
+    assert loaded.error and not loaded.data["startup"]["auto_connect"]
+
+
+@pytest.mark.parametrize("section,key,value", [
+    ("hardware", "filter", "current"),
+    ("hardware", "watchdog_ms", 600),
+    ("startup", "unattended", False),
+])
+def test_version_3_rejects_obsolete_fields(section, key, value):
+    data = defaults()
+    data[section][key] = value
+    with pytest.raises(ValueError):
+        validate(data)
 
 
 @pytest.mark.parametrize("sync,filter",[("dc","fir50"),("sm","iir2"),("freerun","off")])
 def test_invalid_sync_filter_combinations(sync,filter):
     data = defaults()
-    data["hardware"].update(sync=sync,filter=filter)
+    data["hardware"]["sync"] = sync
+    data["modules"]["s2:EL3104"] = dict(filter=filter)
     with pytest.raises(ValueError):
         validate(data)
 
 
 def test_watchdog_tolerance_linkage():
     data = defaults()
-    data["hardware"]["watchdog_ms"] = 100
-    with pytest.raises(ValueError,match="硬件看门狗至少"):
+    data["modules"]["s3:EL4134"] = dict(watchdog_ms=100)
+    with pytest.raises(ValueError,match="看门狗不足以覆盖容错窗口"):
         validate(data)
-    assert validate(defaults())["hardware"]["watchdog_ms"] == 600
+    data["modules"]["s3:EL4134"]["watchdog_ms"] = 600
+    assert validate(data)["modules"]["s3:EL4134"]["watchdog_ms"] == 600
 
 
 def test_mixed_profiles_shared_readonly_and_single_writer():
@@ -326,7 +362,7 @@ def test_malformed_json_structure_recovers_without_crashing(tmp_path,monkeypatch
     with pytest.raises(ValueError):validate(config)
     (tmp_path/"settings.json").write_text(json.dumps(config),encoding="utf-8")
     loaded=Settings()
-    assert loaded.error and not loaded.data["startup"]["unattended"]
+    assert loaded.error and not loaded.data["startup"]["auto_connect"]
 
 
 def test_history_export_uses_stable_batches_during_collection():

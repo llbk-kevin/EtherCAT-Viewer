@@ -54,7 +54,8 @@ def bus():
 def test_sync_filter_watchdog_readback(sync,filter):
     hardware = bus()
     config = defaults()
-    config["hardware"].update(sync=sync,filter=filter)
+    config["hardware"]["sync"] = sync
+    config["modules"]["s2:EL3104"] = dict(filter=filter)
     hardware.configure(config)
     assert hardware.watchdog == 600
     details = hardware.hardware_details

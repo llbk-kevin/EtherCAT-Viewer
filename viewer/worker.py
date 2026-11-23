@@ -62,6 +62,7 @@ class Worker:
         self.parameter_readback = {"values":{},"fields":{},"time_ns":None}
         self.next_parameter_poll = 0
         self.parameter_drift = set()
+        self.parameter_failures = set()
 
     @property
     def period_ns(self):
@@ -196,6 +197,13 @@ class Worker:
             self.next_parameter_poll = now+5_000_000_000
         result = self.bus.parameter_poll_step()
         if result:
+            previous = self.parameter_readback["fields"].get(result["path"],{})
+            if result.get("error") is not None:
+                result["last_success_ns"] = previous.get("last_success_ns")
+                result["last_success_value"] = previous.get("last_success_value")
+            else:
+                result["last_success_ns"] = result["time_ns"]
+                result["last_success_value"] = result["value"]
             self.parameter_readback["fields"][result["path"]] = result
             self.parameter_readback["time_ns"] = result["time_ns"]
             self.parameter_readback["last_duration_ms"] = result["duration_ms"]
@@ -209,6 +217,14 @@ class Worker:
                 return
             if expected is None and path[:3] == ["faults","policies","bus"]:
                 expected = dict(action="zero",voltage=0)
+            if result.get("error") is not None:
+                if result["path"] not in self.parameter_failures:
+                    self.event("设备参数读取失败","alarm","warning",parameter=result,expected=expected)
+                self.parameter_failures.add(result["path"])
+                return
+            if result["path"] in self.parameter_failures:
+                self.parameter_failures.discard(result["path"])
+                self.event("设备参数读取已恢复","alarm","info",parameter=result,expected=expected)
             mismatch = result["value"] != expected and expected not in (None,"current")
             changed = result["path"] not in self.parameter_drift if mismatch else result["path"] in self.parameter_drift
             if mismatch:

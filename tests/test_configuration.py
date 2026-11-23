@@ -1,4 +1,4 @@
-"""逐项应用、关联参数、迁移和真实回读模型的行为回归。"""
+"""逐项应用、关联参数、配置和真实回读模型的行为回归。"""
 import asyncio
 from copy import deepcopy
 from types import SimpleNamespace
@@ -19,7 +19,8 @@ def configuration():
     slaves = [SimpleNamespace(man=2,id=p,rev=1,name=n) for p,n in EXPECTED]
     channels, signature = channel_catalog(slaves)
     data["topology"].update(channels=channels,fingerprint=signature)
-    data["hardware"].update(sync="sm",filter="off",interface=r"\Device\NPF_{TEST}")
+    data["hardware"].update(sync="sm",interface=r"\Device\NPF_{TEST}")
+    data["modules"]["s2:EL3104"] = dict(filter="off")
     return validate(data)
 
 
@@ -68,22 +69,27 @@ def test_unrelated_switch_does_not_reconfigure_preserved_filter():
     assert len(plan["changes"]) == 1 and plan["mode"] == "live"
 
 
-def test_module_and_boot_migration_preserve_card_ids_and_settings():
+def test_discovered_modules_get_native_defaults_and_keep_saved_values():
+    data = defaults()
+    slaves = [SimpleNamespace(man=2,id=p,rev=1,name=n) for p,n in EXPECTED]
+    channels, signature = channel_catalog(slaves)
+    data["topology"].update(channels=channels, fingerprint=signature)
+    discovered = validate(data)
+    assert discovered["modules"] == {"s2:EL3104": {"filter": "current"}, "s3:EL4134": {"watchdog_ms": 600}}
+    discovered["modules"]["s2:EL3104"]["filter"] = "fir60"
+    discovered["modules"]["s3:EL4134"]["watchdog_ms"] = 900
+    assert validate(discovered)["modules"] == discovered["modules"]
+
+
+def test_native_boot_options_preserve_card_ids_and_settings():
     data = configuration()
-    data["bridge"] = preset(data["topology"]["channels"],data["topology"]["fingerprint"],"legacy")
-    data["version"] = 2
-    data.pop("modules")
-    data["startup"].pop("auto_connect")
-    data["startup"]["unattended"] = True
-    for card in data["bridge"]["cards"]:
-        card.pop("start_on_boot")
-        card.pop("authorize_on_boot")
-    migrated = validate(data)
-    assert migrated["version"] == 3 and migrated["startup"]["auto_connect"]
-    assert [c["id"] for c in migrated["bridge"]["cards"]] == [c["id"] for c in data["bridge"]["cards"]]
-    assert all(c["start_on_boot"] and c["authorize_on_boot"] for c in migrated["bridge"]["cards"])
-    assert migrated["modules"]["s2:EL3104"]["filter"] == "off"
-    assert migrated["modules"]["s3:EL4134"]["watchdog_ms"] == 600
+    data["bridge"] = preset(data["topology"]["channels"], data["topology"]["fingerprint"], "legacy")
+    cards = data["bridge"]["cards"]
+    data["startup"]["auto_connect"] = True
+    cards[0].update(start_on_boot=True, authorize_on_boot=True)
+    checked = validate(data)
+    assert checked["startup"]["auto_connect"]
+    assert checked["bridge"]["cards"] == cards
 
 
 def test_same_value_save_does_not_touch_disk_or_revision(tmp_path,monkeypatch):
@@ -178,6 +184,16 @@ def test_noop_does_not_send_worker_command(tmp_path,monkeypatch):
     revision = obj.settings.data["revision"]
     result = asyncio.run(obj.apply_settings(request,plan["changes"]))
     assert result["noop"] and obj.calls == [] and obj.settings.data["revision"] == revision
+
+
+def test_startup_option_saves_without_global_operation_or_worker_command(tmp_path,monkeypatch):
+    obj = service(tmp_path,monkeypatch)
+    request = [change(obj.settings.data, ["startup", "open_browser"], False)]
+    plan = obj.settings_plan(request)
+    saved = asyncio.run(obj.apply_settings(request, plan["changes"]))
+    assert not saved["config"]["startup"]["open_browser"]
+    assert not Settings().data["startup"]["open_browser"]
+    assert obj.operation is None and not obj.calls
 
 
 def test_live_apply_changes_only_requested_parameter(tmp_path,monkeypatch):
@@ -298,13 +314,13 @@ def test_invalid_approved_plan_has_no_side_effect(tmp_path,monkeypatch):
     assert not obj.calls
 
 
-def test_login_registry_failure_cannot_leave_operation_running(tmp_path,monkeypatch):
+def test_login_registry_failure_stays_on_the_setting(tmp_path,monkeypatch):
     obj = service(tmp_path,monkeypatch)
     monkeypatch.setattr("viewer.server.set_login",lambda *_args:(_ for _ in ()).throw(OSError("启动项写入被拒绝")))
     request = [change(obj.settings.data,["startup","login"],True)]
     plan = obj.settings_plan(request)
     with pytest.raises(SettingError,match="被拒绝"):
         asyncio.run(obj.apply_settings(request,plan["changes"]))
-    assert obj.operation["state"] == "failed"
+    assert obj.operation is None
     assert not obj.settings.data["startup"]["login"]
-    assert obj.calls == ["runtime_config","runtime_config"]
+    assert not obj.calls

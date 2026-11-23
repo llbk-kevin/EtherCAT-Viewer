@@ -12,7 +12,9 @@ def finite(value, label):
 def validate_profile(data):
     if not isinstance(data, dict):
         raise ValueError("通道配置必须是对象")
-    result = dict(data)
+    if set(data)-{"name","calibration","engineering","measurements"}:
+        raise ValueError("通道配置含不支持的字段")
+    result = {}
     result["name"] = str(data.get("name", ""))[:100]
     calibration = data.get("calibration", {})
     if not isinstance(calibration, dict):
@@ -32,8 +34,14 @@ def validate_profile(data):
     result["engineering"] = dict(enabled=bool(engineering.get("enabled", False)),
                                   unit=str(engineering.get("unit", ""))[:30], **values)
     result["measurements"] = data.get("measurements", [])
-    if not isinstance(result["measurements"], list) or len(result["measurements"]) > 100 or any(not isinstance(m,dict) for m in result["measurements"]):
-        raise ValueError("每通道最多保存 100 条测量记录")
+    if not isinstance(result["measurements"], list) or len(result["measurements"]) > 100:
+        raise ValueError("每通道最多保存 100 条两点校准记录")
+    for measurement in result["measurements"]:
+        if not isinstance(measurement,dict) or measurement.get("type") != "two_point":
+            raise ValueError("校准记录只接受当前两点格式")
+        points = [finite(measurement.get(key),"校准记录 "+key) for key in ("x1","y1","x2","y2")]
+        if points[0] == points[2]:
+            raise ValueError("校准记录的两个输入点不能相同")
     return result
 
 

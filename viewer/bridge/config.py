@@ -1,15 +1,13 @@
-"""虚拟设备配置；持久化文件仅包含配置，不恢复运行或输出状态。"""
+"""虚拟设备配置校验和模板。"""
 import ipaddress
 import json
-import os
-from pathlib import Path
 import uuid
 
 from ..paths import powershell_path
 
 
-def config_path():
-    return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local") / "EtherCAT-Viewer" / "bridge.json"
+def empty_config():
+    return dict(version=1, fingerprint="", cards=[])
 
 
 def local_addresses():
@@ -130,23 +128,3 @@ def preset(channels, fingerprint, profile):
                           allow=["127.0.0.1/32"], ai=inputs, ao=outputs, ao_range="original",
                           sampling="hold", send_ms=50, backlog_ms=2000, saved_range=2, saved_divider=65000))
     return dict(version=1, fingerprint=fingerprint, cards=cards)
-
-
-def save_config(data):
-    target = config_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(".tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(target)
-
-
-def load_config():
-    try:
-        data = json.loads(config_path().read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or data.get("version") != 1:
-            raise ValueError("不支持的配置版本")
-        return data, ""
-    except FileNotFoundError:
-        return dict(version=1, fingerprint="", cards=[]), ""
-    except (OSError, ValueError) as exc:
-        return dict(version=1, fingerprint="", cards=[]), f"配置读取失败：{exc}"

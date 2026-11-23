@@ -233,8 +233,7 @@ def free_port():
         return sock.getsockname()[1]
 
 
-async def fixture_bridge(tmp_path, monkeypatch, profile="legacy", two=False):
-    monkeypatch.setattr(config, "config_path", lambda: tmp_path / "bridge.json")
+async def fixture_bridge(monkeypatch, profile="legacy", two=False):
     monkeypatch.setattr("viewer.bridge.runtime.local_addresses", lambda: ["127.0.0.1"])
     monkeypatch.setattr(Bridge, "log", lambda self, text: self.events.append(dict(message=text)))
     worker = make_worker()
@@ -268,9 +267,9 @@ async def fixture_bridge(tmp_path, monkeypatch, profile="legacy", two=False):
     return worker, manager, feeder_task
 
 
-def test_socket_legacy_finite_capture_second_client_and_disconnect_zero(tmp_path, monkeypatch):
+def test_socket_legacy_finite_capture_second_client_and_disconnect_zero(monkeypatch):
     async def check():
-        worker, manager, feeder = await fixture_bridge(tmp_path, monkeypatch)
+        worker, manager, feeder = await fixture_bridge(monkeypatch)
         card = next(iter(manager.cards.values()))
         reader, writer = await asyncio.open_connection("127.0.0.1", card.config["port"])
         try:
@@ -304,9 +303,9 @@ def test_socket_legacy_finite_capture_second_client_and_disconnect_zero(tmp_path
     run(check())
 
 
-def test_socket_extended_multiple_readers_and_owner(tmp_path, monkeypatch):
+def test_socket_extended_multiple_readers_and_owner(monkeypatch):
     async def check():
-        worker, manager, feeder = await fixture_bridge(tmp_path, monkeypatch, "extended")
+        worker, manager, feeder = await fixture_bridge(monkeypatch, "extended")
         card = next(iter(manager.cards.values()))
         pairs = [await asyncio.open_connection("127.0.0.1", card.config["port"]) for _ in range(2)]
         async def command(pair, opcode, args):
@@ -381,9 +380,9 @@ def test_high_rate_hold_is_bounded_and_counts_real_sources():
         large.feed(source(2, 1_010_000_000))
 
 
-def test_socket_invalid_wave_keeps_output_unsupported_command_zeroes(tmp_path, monkeypatch):
+def test_socket_invalid_wave_keeps_output_unsupported_command_zeroes(monkeypatch):
     async def check():
-        worker, manager, feeder = await fixture_bridge(tmp_path, monkeypatch)
+        worker, manager, feeder = await fixture_bridge(monkeypatch)
         card = next(iter(manager.cards.values()))
         reader, writer = await asyncio.open_connection("127.0.0.1", card.config["port"])
         try:
@@ -410,9 +409,8 @@ def test_socket_invalid_wave_keeps_output_unsupported_command_zeroes(tmp_path, m
     run(check())
 
 
-def test_startup_port_conflict_releases_partial_listeners(tmp_path, monkeypatch):
+def test_startup_port_conflict_releases_partial_listeners(monkeypatch):
     async def check():
-        monkeypatch.setattr(config, "config_path", lambda: tmp_path/"bridge.json")
         monkeypatch.setattr("viewer.bridge.runtime.local_addresses", lambda: ["127.0.0.1"])
         worker = make_worker()
         async def request(action, args):
@@ -433,9 +431,9 @@ def test_startup_port_conflict_releases_partial_listeners(tmp_path, monkeypatch)
     run(check())
 
 
-def test_slow_sender_timeout_revokes_only_its_card(tmp_path, monkeypatch):
+def test_slow_sender_timeout_revokes_only_its_card(monkeypatch):
     async def check():
-        worker, manager, feeder = await fixture_bridge(tmp_path, monkeypatch, two=True)
+        worker, manager, feeder = await fixture_bridge(monkeypatch, two=True)
         cards = list(manager.cards.values())
         pairs = [await asyncio.open_connection("127.0.0.1", c.config["port"]) for c in cards]
         try:
@@ -462,24 +460,42 @@ def test_slow_sender_timeout_revokes_only_its_card(tmp_path, monkeypatch):
 
 
 def test_saved_range_and_divider_survive_new_runtime(tmp_path, monkeypatch):
+    from viewer.bridge.runtime import Card, Session
+    from viewer.server import Service
+    from viewer.settings import Settings
+
     async def check():
-        worker, manager, feeder = await fixture_bridge(tmp_path, monkeypatch)
+        monkeypatch.setattr("viewer.settings.settings_path", lambda: tmp_path/"settings.json")
+        _, manager, feeder = await fixture_bridge(monkeypatch)
+        service = Service.__new__(Service)
+        service.settings = Settings()
+        service.config_lock = asyncio.Lock()
+        service.bridge = manager
+        service.settings.save(dict(service.settings.data, bridge=manager.config), 0)
+        manager.persist_callback = service.persist_bridge
         card = next(iter(manager.cards.values()))
         reader, writer = await asyncio.open_connection("127.0.0.1", card.config["port"])
-        writer.write(p.legacy_command(0xA3E2, bytes([1, 2]))+
-                     p.legacy_command(0xA3D0, struct.pack("<HB", 32500, 2))+
-                     p.legacy_command(0xA452, bytes.fromhex("13A4F1C5")))
-        await writer.drain()
-        reply = await asyncio.wait_for(reader.readexactly(46), 2)
-        assert reply[37] == 1 and struct.unpack_from("<H", reply, 40)[0] == 32500
-        saved, error = config.load_config()
-        assert not error and saved["cards"][0]["saved_range"] == 1
-        assert saved["cards"][0]["saved_divider"] == 32500
-        writer.close()
-        await writer.wait_closed()
-        await manager.stop(shutdown=True)
-        feeder.cancel()
-        await asyncio.gather(feeder, return_exceptions=True)
+        try:
+            writer.write(p.legacy_command(0xA3E2, bytes([1, 2]))+
+                         p.legacy_command(0xA3D0, struct.pack("<HB", 32500, 2))+
+                         p.legacy_command(0xA452, bytes.fromhex("13A4F1C5")))
+            await writer.drain()
+            reply = await asyncio.wait_for(reader.readexactly(46), 2)
+            assert reply[37] == 1 and struct.unpack_from("<H", reply, 40)[0] == 32500
+            loaded = Settings()
+            assert not loaded.error and loaded.data["revision"] == 3
+            replacement = Bridge(manager.request, manager.critical)
+            replacement.replace_config(loaded.data["bridge"])
+            peer = SimpleNamespace(get_extra_info=lambda _name: ("127.0.0.1", 1234))
+            resumed = Session(replacement, Card(replacement.config["cards"][0]), None, peer)
+            assert (resumed.range, resumed.divider) == (1, 32500)
+            assert not (tmp_path/"bridge.json").exists()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            await manager.stop(shutdown=True)
+            feeder.cancel()
+            await asyncio.gather(feeder, return_exceptions=True)
     run(check())
 
 
@@ -521,9 +537,8 @@ def test_capture_does_not_backfill_samples_before_start():
     assert session.sampler.sources == 1 and session.sampler.previous[0]["seq"] == 2
 
 
-def test_bridge_does_not_report_confirmed_zero_after_fault_or_stale_source(tmp_path, monkeypatch):
+def test_bridge_does_not_report_confirmed_zero_after_fault_or_stale_source():
     from viewer.bridge.runtime import Card
-    monkeypatch.setattr(config, "config_path", lambda: tmp_path/"bridge.json")
     async def request(_action, _args):
         return None
     manager = Bridge(request, lambda: None)

@@ -5,59 +5,25 @@ import os
 from pathlib import Path
 from .calibration import validate_profile, drive_voltage
 from .generator import validated_period
-from .bridge.config import validate_config
+from .bridge.config import empty_config, validate_config
 
 
 def settings_path():
     return Path(os.environ.get("LOCALAPPDATA") or Path.home()/"AppData/Local")/"EtherCAT-Viewer"/"settings.json"
 
 
-def migrate(data):
-    if not isinstance(data, dict) or data.get("version") not in (2, 3):
-        raise ValueError("配置版本必须为 2 或 3")
-    out = deepcopy(data)
-    out["version"] = 3
-    startup = out.get("startup", {})
-    if isinstance(startup, dict):
-        old = startup.get("unattended", False) if data["version"] == 2 else False
-        startup.setdefault("auto_connect", old)
-        startup["unattended"] = False
-        for card in out.get("bridge", {}).get("cards", []) if isinstance(out.get("bridge"), dict) else []:
-            if isinstance(card, dict):
-                card.setdefault("start_on_boot", bool(old and card.get("enabled", True)))
-                card.setdefault("authorize_on_boot", bool(old and card.get("enabled", True)))
-    modules = out.setdefault("modules", {})
-    topology = out.get("topology", {})
-    hardware = out.get("hardware", {})
-    if isinstance(modules, dict) and isinstance(topology, dict) and isinstance(hardware, dict):
-        channels = topology.get("channels", {})
-        if isinstance(channels, dict):
-            for kind in ("ai", "ao"):
-                rows = channels.get(kind, [])
-                for channel in rows if isinstance(rows, list) else []:
-                    if not isinstance(channel, dict) or not isinstance(channel.get("id"), str):
-                        continue
-                    if (":EL3104:" if kind == "ai" else ":EL4134:") not in channel["id"]:
-                        continue
-                    ident = channel["id"].rsplit(":", 1)[0]
-                    if kind == "ai":
-                        modules.setdefault(ident, dict(filter=hardware.get("filter", "current")))
-                    else:
-                        modules.setdefault(ident, dict(watchdog_ms=hardware.get("watchdog_ms", 600)))
-    return out
-
-
 def module_settings(configuration, slave_position, model):
     return configuration.get("modules", {}).get(f"s{slave_position}:{model}", {})
 
+
 def defaults():
     return dict(version=3, revision=0, modules={},
-                hardware=dict(interface="", period_ms=10, sync="current", filter="current", receive_timeout_us=2000, watchdog_ms=600),
+                hardware=dict(interface="", period_ms=10, sync="current", receive_timeout_us=2000),
                 faults=dict(consecutive=10, duration_ms=500, auto_reconnect=True, web_wait_ms=5000,
                             policies={"bus": {}, "web": {}, "tcp": {}}),
-                startup=dict(unattended=False, auto_connect=False, open_browser=True, minimized=False, login=False),
+                startup=dict(auto_connect=False, open_browser=True, minimized=False, login=False),
                 topology=dict(channels={"ai": [], "ao": []}, fingerprint="", devices=[]),
-                channels={}, bridge=dict(version=1, fingerprint="", cards=[]))
+                channels={}, bridge=empty_config())
 
 
 def integer(value, low, high, label):
@@ -67,7 +33,8 @@ def integer(value, low, high, label):
 
 
 def validate(data):
-    data = migrate(data)
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 3:
+        raise ValueError("配置版本必须为 3")
     out = defaults()
     for section in ("hardware", "faults", "startup", "topology"):
         if not isinstance(data.get(section, {}), dict):
@@ -77,27 +44,22 @@ def validate(data):
     if not isinstance(out["modules"], dict):
         raise ValueError("模块配置必须为对象")
     h, f = out["hardware"], out["faults"]
+    if "filter" in h or "watchdog_ms" in h:
+        raise ValueError("滤波和看门狗仅支持逐模块配置")
+    if "unattended" in out["startup"]:
+        raise ValueError("启动配置仅支持 auto_connect，请删除 unattended")
     h["interface"] = str(h["interface"])
     validated_period(h["period_ms"])
     if h["sync"] not in ("current", "freerun", "sm", "dc"):
         raise ValueError("同步模式无效")
-    if h["filter"] not in ("current", "off", "fir50", "fir60", *[f"iir{i}" for i in range(1,9)]):
-        raise ValueError("滤波设置无效")
-    if not out["modules"] and h["sync"] in ("sm", "dc") and h["filter"] not in ("off", "current"):
-        raise ValueError("帧同步／DC 模式必须关闭输入滤波")
-    if not out["modules"] and h["sync"] == "freerun" and h["filter"] == "off":
-        raise ValueError("EL3104 自由运行需要启用滤波")
     integer(h["receive_timeout_us"], 100, 20000, "收包超时 / μs")
     integer(f["consecutive"], 1, 10000, "连续异常次数")
     integer(f["duration_ms"], 1, 10000, "容错时间 / ms")
     integer(f["web_wait_ms"], 0, 3600000, "网页失联等待时间 / ms")
-    integer(h["watchdog_ms"], 10, 20000, "硬件看门狗 / ms")
-    if not any("watchdog_ms" in m for m in out["modules"].values() if isinstance(m, dict)) and h["watchdog_ms"] < f["duration_ms"] + max(50, h["period_ms"]*2):
-        raise ValueError("硬件看门狗至少为容错时间＋max(50 ms, 2 个通信周期)")
     for key in ("auto_reconnect",):
         if type(f[key]) is not bool:
             raise ValueError(f"{key} 必须为布尔值")
-    for key in ("unattended", "auto_connect", "open_browser", "minimized", "login"):
+    for key in ("auto_connect", "open_browser", "minimized", "login"):
         if type(out["startup"][key]) is not bool:
             raise ValueError(f"{key} 必须为布尔值")
     if not isinstance(data.get("channels", {}), dict):
@@ -115,7 +77,13 @@ def validate(data):
         if len({c["id"] for c in rows}) != len(rows):
             raise ValueError("保存的真实通道 ID 重复")
         for channel in rows:
-            out["channels"].setdefault(channel["id"],validate_profile({}))
+            channel_id = channel["id"]
+            out["channels"].setdefault(channel_id, validate_profile({}))
+            module_id = channel_id.rsplit(":", 1)[0]
+            if kind == "ai" and module_id.endswith(":EL3104"):
+                out["modules"].setdefault(module_id, dict(filter="current"))
+            elif kind == "ao" and module_id.endswith(":EL4134"):
+                out["modules"].setdefault(module_id, dict(watchdog_ms=600))
     policies = f.get("policies", {})
     if not isinstance(policies,dict) or any(not isinstance(policies.get(k,{}),dict) for k in ("bus","web","tcp")):
         raise ValueError("故障策略必须按类型与通道保存为对象")
@@ -172,13 +140,6 @@ class Settings:
             self.data = validate(json.loads(self.path.read_text(encoding="utf-8")))
         except FileNotFoundError:
             self.data = defaults()
-            legacy = self.path.with_name("bridge.json")
-            if legacy.exists():
-                try:
-                    self.data["bridge"] = json.loads(legacy.read_text(encoding="utf-8"))
-                    self.data = validate(self.data)
-                except (ValueError, OSError) as exc:
-                    self.error = f"旧桥接配置迁移失败：{exc}"
         except (ValueError, OSError) as exc:
             self.data = defaults()
             self.error = f"配置读取失败，已禁止无人值守启动：{exc}；可导入备份恢复"
