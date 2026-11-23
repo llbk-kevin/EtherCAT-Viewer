@@ -15,3 +15,13 @@ PySOEM 1.1.13 使用 MIT 许可证。其 Windows wheel 静态编入 SOEM 代码�
 ## 三、系统驱动
 
 实机所需 Npcap 由使用者单独下载和安装。驱动、安装器以及 Npcap DLL 由 [Npcap 官网](https://npcap.com/#download) 提供。
+
+## 四、设备产品图片
+
+离线模块缩略图来自 Beckhoff 官方公开产品资料，图片版权归 Beckhoff Automation 所有，用于在本项目中识别对应真实模块，未修改产品内容。
+
+- EK1100：[官方产品页](https://www.beckhoff.com/en-us/products/i-o/ethercat-terminals/ek1xxx-bk1xx0-ethercat-coupler/ek1100.html) · [图片来源](https://multimedia.beckhoff.com/media/ek1100__web_preview.png)
+- EL3104：[官方产品页](https://www.beckhoff.com/en-us/products/i-o/ethercat-terminals/el-ed3xxx-analog-input/el3104.html) · [图片来源](https://multimedia.beckhoff.com/media/el3104__web_preview.png)
+- EL4134：[官方产品页](https://www.beckhoff.com/en-us/products/i-o/ethercat-terminals/el-ed4xxx-analog-output/el4134.html) · [图片来源](https://multimedia.beckhoff.com/media/el4134_es4134__web_preview.png)
+
+文件位于 viewer/static/images/modules/，未使用在线运行依赖。

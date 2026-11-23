@@ -12,12 +12,50 @@ def settings_path():
     return Path(os.environ.get("LOCALAPPDATA") or Path.home()/"AppData/Local")/"EtherCAT-Viewer"/"settings.json"
 
 
+def migrate(data):
+    if not isinstance(data, dict) or data.get("version") not in (2, 3):
+        raise ValueError("配置版本必须为 2 或 3")
+    out = deepcopy(data)
+    out["version"] = 3
+    startup = out.get("startup", {})
+    if isinstance(startup, dict):
+        old = startup.get("unattended", False) if data["version"] == 2 else False
+        startup.setdefault("auto_connect", old)
+        startup["unattended"] = False
+        for card in out.get("bridge", {}).get("cards", []) if isinstance(out.get("bridge"), dict) else []:
+            if isinstance(card, dict):
+                card.setdefault("start_on_boot", bool(old and card.get("enabled", True)))
+                card.setdefault("authorize_on_boot", bool(old and card.get("enabled", True)))
+    modules = out.setdefault("modules", {})
+    topology = out.get("topology", {})
+    hardware = out.get("hardware", {})
+    if isinstance(modules, dict) and isinstance(topology, dict) and isinstance(hardware, dict):
+        channels = topology.get("channels", {})
+        if isinstance(channels, dict):
+            for kind in ("ai", "ao"):
+                rows = channels.get(kind, [])
+                for channel in rows if isinstance(rows, list) else []:
+                    if not isinstance(channel, dict) or not isinstance(channel.get("id"), str):
+                        continue
+                    if (":EL3104:" if kind == "ai" else ":EL4134:") not in channel["id"]:
+                        continue
+                    ident = channel["id"].rsplit(":", 1)[0]
+                    if kind == "ai":
+                        modules.setdefault(ident, dict(filter=hardware.get("filter", "current")))
+                    else:
+                        modules.setdefault(ident, dict(watchdog_ms=hardware.get("watchdog_ms", 600)))
+    return out
+
+
+def module_settings(configuration, slave_position, model):
+    return configuration.get("modules", {}).get(f"s{slave_position}:{model}", {})
+
 def defaults():
-    return dict(version=2, revision=0,
+    return dict(version=3, revision=0, modules={},
                 hardware=dict(interface="", period_ms=10, sync="current", filter="current", receive_timeout_us=2000, watchdog_ms=600),
                 faults=dict(consecutive=10, duration_ms=500, auto_reconnect=True, web_wait_ms=5000,
                             policies={"bus": {}, "web": {}, "tcp": {}}),
-                startup=dict(unattended=False, open_browser=True, minimized=False, login=False),
+                startup=dict(unattended=False, auto_connect=False, open_browser=True, minimized=False, login=False),
                 topology=dict(channels={"ai": [], "ao": []}, fingerprint="", devices=[]),
                 channels={}, bridge=dict(version=1, fingerprint="", cards=[]))
 
@@ -29,13 +67,15 @@ def integer(value, low, high, label):
 
 
 def validate(data):
-    if not isinstance(data, dict) or data.get("version") != 2:
-        raise ValueError("配置版本必须为 2")
+    data = migrate(data)
     out = defaults()
     for section in ("hardware", "faults", "startup", "topology"):
         if not isinstance(data.get(section, {}), dict):
             raise ValueError(f"{section} 配置必须为对象")
         out[section].update(deepcopy(data.get(section, {})))
+    out["modules"] = deepcopy(data.get("modules", {}))
+    if not isinstance(out["modules"], dict):
+        raise ValueError("模块配置必须为对象")
     h, f = out["hardware"], out["faults"]
     h["interface"] = str(h["interface"])
     validated_period(h["period_ms"])
@@ -43,21 +83,21 @@ def validate(data):
         raise ValueError("同步模式无效")
     if h["filter"] not in ("current", "off", "fir50", "fir60", *[f"iir{i}" for i in range(1,9)]):
         raise ValueError("滤波设置无效")
-    if h["sync"] in ("sm", "dc") and h["filter"] not in ("off", "current"):
+    if not out["modules"] and h["sync"] in ("sm", "dc") and h["filter"] not in ("off", "current"):
         raise ValueError("帧同步／DC 模式必须关闭输入滤波")
-    if h["sync"] == "freerun" and h["filter"] == "off":
+    if not out["modules"] and h["sync"] == "freerun" and h["filter"] == "off":
         raise ValueError("EL3104 自由运行需要启用滤波")
     integer(h["receive_timeout_us"], 100, 20000, "收包超时 / μs")
     integer(f["consecutive"], 1, 10000, "连续异常次数")
     integer(f["duration_ms"], 1, 10000, "容错时间 / ms")
     integer(f["web_wait_ms"], 0, 3600000, "网页失联等待时间 / ms")
     integer(h["watchdog_ms"], 10, 20000, "硬件看门狗 / ms")
-    if h["watchdog_ms"] < f["duration_ms"] + max(50, h["period_ms"]*2):
+    if not any("watchdog_ms" in m for m in out["modules"].values() if isinstance(m, dict)) and h["watchdog_ms"] < f["duration_ms"] + max(50, h["period_ms"]*2):
         raise ValueError("硬件看门狗至少为容错时间＋max(50 ms, 2 个通信周期)")
     for key in ("auto_reconnect",):
         if type(f[key]) is not bool:
             raise ValueError(f"{key} 必须为布尔值")
-    for key in ("unattended", "open_browser", "minimized", "login"):
+    for key in ("unattended", "auto_connect", "open_browser", "minimized", "login"):
         if type(out["startup"][key]) is not bool:
             raise ValueError(f"{key} 必须为布尔值")
     if not isinstance(data.get("channels", {}), dict):
@@ -74,6 +114,8 @@ def validate(data):
             raise ValueError("保存的真实通道列表无效")
         if len({c["id"] for c in rows}) != len(rows):
             raise ValueError("保存的真实通道 ID 重复")
+        for channel in rows:
+            out["channels"].setdefault(channel["id"],validate_profile({}))
     policies = f.get("policies", {})
     if not isinstance(policies,dict) or any(not isinstance(policies.get(k,{}),dict) for k in ("bus","web","tcp")):
         raise ValueError("故障策略必须按类型与通道保存为对象")
@@ -89,7 +131,24 @@ def validate(data):
     for ident, profile in out["channels"].items():
         if ":AO" in ident:
             drive_voltage(0, profile)
-    if out["startup"]["unattended"] and (not h["interface"] or not out["topology"].get("fingerprint")):
+    for ident, module in out["modules"].items():
+        if not isinstance(module, dict) or not isinstance(ident, str):
+            raise ValueError("模块参数结构无效")
+        if ident.endswith(":EL3104"):
+            selection = module.get("filter")
+            if selection not in ("current", "off", "fir50", "fir60", *[f"iir{i}" for i in range(1,9)]):
+                raise ValueError(f"{ident} 输入滤波无效")
+            if h["sync"] in ("sm", "dc") and selection not in ("current", "off"):
+                raise ValueError(f"{ident} 帧同步／DC 必须关闭滤波")
+            if h["sync"] == "freerun" and selection == "off":
+                raise ValueError(f"{ident} 自由运行需要滤波")
+        elif ident.endswith(":EL4134"):
+            value = integer(module.get("watchdog_ms"), 10, 20000, ident+" 看门狗 / ms")
+            if value < f["duration_ms"]+max(50,h["period_ms"]*2):
+                raise ValueError(f"{ident} 看门狗不足以覆盖容错窗口")
+        else:
+            raise ValueError("不支持该模块配置："+ident)
+    if out["startup"]["auto_connect"] and (not h["interface"] or not out["topology"].get("fingerprint")):
         raise ValueError("启用无人值守前请先选择网卡并成功连接核对拓扑")
     out["bridge"] = deepcopy(data.get("bridge", out["bridge"]))
     bridge = out["bridge"]
@@ -128,6 +187,8 @@ class Settings:
         if revision != self.data["revision"]:
             raise ValueError("配置已被其他页面修改，请重新读取后保存")
         checked = validate(data)
+        if checked == self.data:
+            return deepcopy(self.data)
         checked["revision"] = revision+1
         encoded = json.dumps(checked, ensure_ascii=False, indent=2, allow_nan=False)
         self.path.parent.mkdir(parents=True, exist_ok=True)

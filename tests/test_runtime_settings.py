@@ -45,6 +45,7 @@ def test_settings_atomic_revision_backup_and_migration(tmp_path,monkeypatch):
     saved = store.save(data,0)
     assert saved["revision"] == 1
     assert Settings().data["faults"]["consecutive"] == 17
+    saved["startup"]["open_browser"] = False
     store.save(saved,1)
     assert json.loads((tmp_path/"settings.backup.json").read_text(encoding="utf-8"))["revision"] == 1
     with pytest.raises(ValueError,match="其他页面"):

@@ -69,17 +69,25 @@ class Bridge:
         except OSError:
             pass
 
+    def replace_config(self, data):
+        self.config = data
+        by_id = {c["id"]:c for c in data["cards"]}
+        for ident,card in self.cards.items():
+            if ident in by_id:
+                card.config = by_id[ident]
+
     async def configure(self, data, status):
         if self.active:
             by_id = {c["id"]: c for c in data.get("cards", [])}
             if any(by_id.get(ident) != card.config for ident, card in self.cards.items()):
                 raise ValueError("请先停止受影响的虚拟卡再修改配置")
         addresses = await asyncio.to_thread(local_addresses)
-        self.config = validate_config(data, status.get("channels", {}), status.get("fingerprint"), addresses)
+        checked = validate_config(data, status.get("channels", {}), status.get("fingerprint"), addresses)
         if self.persist_callback:
-            await self.persist_callback(self.config)
+            await self.persist_callback(checked)
         else:
-            await asyncio.to_thread(save_config, self.config)
+            await asyncio.to_thread(save_config, checked)
+        self.replace_config(checked)
         self.last_error = ""
         return self.config
 
@@ -97,7 +105,7 @@ class Bridge:
             raise ValueError("请先连接实机并等待通信稳定")
         self.channels = status["channels"]
         config = validate_config(self.config, self.channels, status["fingerprint"], await asyncio.to_thread(local_addresses))
-        self.config = config
+        self.replace_config(config)
         selected = [c for c in config["cards"] if c["enabled"] and c["id"] not in self.cards and (card_id is None or c["id"] == card_id)]
         if not selected:
             raise ValueError("没有尚未监听的启用虚拟卡")
@@ -211,10 +219,10 @@ class Bridge:
         card.sessions.add(session)
         await session.run()
 
-    async def persist(self):
+    async def persist(self, updates=None):
         async with self.persist_lock:
             if self.persist_callback:
-                await self.persist_callback(self.config)
+                await self.persist_callback(self.config,updates=updates)
             else:
                 await asyncio.to_thread(save_config, self.config)
 
@@ -711,7 +719,7 @@ class Session:
                 raise ValueError("保存标志无效")
             if save == 2:
                 self.card.config[key] = value
-                await self.bridge.persist()
+                await self.bridge.persist({self.card.config["id"]:{key:value}})
         elif opcode in (0xA111, 0xA112, 0xA113, 0xA114, 0xA115):
             group = payload[0] if opcode in (0xA112, 0xA114, 0xA115) else 1
             frames = struct.unpack("<I", payload[1:] if len(payload) == 5 else payload)[0]

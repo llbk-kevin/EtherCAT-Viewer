@@ -77,6 +77,10 @@ def validate_config(data, channels, fingerprint, addresses):
         if type(card.get("auto_reauthorize", True)) is not bool:
             raise ValueError("自动重新接管必须为布尔值")
         card["auto_reauthorize"] = card.get("auto_reauthorize", True)
+        for field in ("start_on_boot", "authorize_on_boot"):
+            if type(card.get(field, False)) is not bool:
+                raise ValueError("虚拟卡启动选项必须为布尔值")
+            card[field] = card.get(field, False)
         for kind in ("ai", "ao"):
             mapping = card.get(kind)
             if not isinstance(mapping, list) or len(mapping) > 65535 or (kind == "ai" and not mapping):
@@ -122,7 +126,7 @@ def preset(channels, fingerprint, profile):
         else:
             inputs, outputs = ai or [None], ao
         cards.append(dict(id=uuid.uuid4().hex[:12], name=f"虚拟卡 {i+1}", enabled=True,
-                          profile=profile, ao_writable=[True]*len(outputs), auto_reauthorize=True, host="127.0.0.1", port=(6000 if profile == "legacy" else 7000)+i,
+                          profile=profile, ao_writable=[True]*len(outputs), auto_reauthorize=True, start_on_boot=False, authorize_on_boot=False, host="127.0.0.1", port=(6000 if profile == "legacy" else 7000)+i,
                           allow=["127.0.0.1/32"], ai=inputs, ao=outputs, ao_range="original",
                           sampling="hold", send_ms=50, backlog_ms=2000, saved_range=2, saved_divider=65000))
     return dict(version=1, fingerprint=fingerprint, cards=cards)

@@ -3,6 +3,16 @@ from pathlib import Path
 import subprocess
 import sys
 
+def open_config_directory():
+    if sys.platform != "win32":
+        raise ValueError("打开配置目录仅支持 Windows")
+    import os
+    from .settings import settings_path
+    folder = settings_path().parent
+    folder.mkdir(parents=True,exist_ok=True)
+    os.startfile(str(folder))
+
+
 NAME = "EtherCATViewer"
 KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 

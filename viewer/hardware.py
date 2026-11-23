@@ -6,7 +6,7 @@ import time
 from uuid import UUID
 
 from .paths import powershell_path
-from .pdo import Mapping, read_int, read_mapping, raw_voltage
+from .pdo import Mapping, read_int, read_mapping, raw_voltage, volts
 
 EXPECTED = [(0x044C2C52, "EK1100"), (0x0C203052, "EL3104"), (0x10263052, "EL4134")]
 INIT, PREOP, SAFEOP, OP = 1, 2, 4, 8
@@ -218,7 +218,9 @@ class Hardware:
                             channels=self.channels, fingerprint=self.fingerprint, sm2=sm_details)
         watchdogs = []
         for slave, _ in self.ao_modules:
-            target = configuration["hardware"]["watchdog_ms"] if configuration else 100
+            from .settings import module_settings
+            position = self.master.slaves.index(slave)+1
+            target = module_settings(configuration,position,slave.name).get("watchdog_ms",configuration["hardware"]["watchdog_ms"]) if configuration else 100
             value = slave.get_watchdog("processdata")
             if abs(value-target) > 1:
                 slave.set_watchdog("processdata", target)
@@ -240,6 +242,8 @@ class Hardware:
                     shift, sync1 = self.dc_parameters(slave)
                     slave.dc_sync(True, configuration["hardware"]["period_ms"]*1000000, shift, sync1)
                     detail["dc"] = dict(sync0_shift_ns=shift, sync1_delta_ns=sync1, cycle_ns=configuration["hardware"]["period_ms"]*1000000)
+        self.parameter_values, self.parameter_modes = {}, {}
+        self.parameter_poll_start()
         self.master.state = SAFEOP
         self.master.write_state()
         self.master.state_check(SAFEOP, 2000000)
@@ -292,6 +296,7 @@ class Hardware:
 
     def apply_configuration(self, configuration):
         from .calibration import drive_voltage
+        from .settings import module_settings
         h = configuration["hardware"]
         profiles = configuration["channels"]
         policies = configuration["faults"]["policies"]["bus"]
@@ -301,6 +306,9 @@ class Hardware:
                 raise RuntimeError(f"{slave.name} 参数 {index:04X}:{sub:02X} 回读不一致")
         for kind, modules in (("ai", self.ai_modules), ("ao", self.ao_modules)):
             for module_index, (slave, _) in enumerate(modules):
+                position = self.master.slaves.index(slave)+1
+                module = module_settings(configuration,position,slave.name)
+                selection = module.get("filter",h["filter"])
                 parameter = 0x1C33 if kind == "ai" else 0x1C32
                 supported = read_int(slave, parameter, 4, 2)
                 minimum = read_int(slave, parameter, 5, 4)
@@ -315,7 +323,7 @@ class Hardware:
                     if h["sync"] != "dc":
                         slave.dc_sync(False, 0)
                     if kind == "ai":
-                        selected_filter = h["filter"]
+                        selected_filter = selection
                         if h["sync"] in ("sm", "dc"):
                             selected_filter = "off"
                         elif h["sync"] == "freerun" and selected_filter == "current":
@@ -323,10 +331,10 @@ class Hardware:
                         self.set_filter(slave, selected_filter, checked_write)
                     checked_write(slave, parameter, 1, requested, 2)
                     mode = requested
-                elif kind == "ai" and h["filter"] != "current":
-                    self.set_filter(slave, h["filter"], checked_write)
+                elif kind == "ai" and selection != "current":
+                    self.set_filter(slave, selection, checked_write)
                     mode = read_int(slave, parameter, 1, 2)
-                detail = dict(name=slave.name, kind=kind, sync_mode=mode, supported_modes=supported,
+                detail = dict(id=f"s{position}:{slave.name}",position=position,name=slave.name, kind=kind, sync_mode=mode, supported_modes=supported,
                               minimum_cycle_ns=minimum)
                 if kind == "ai":
                     detail.update(filter_enabled=read_int(slave, 0x8000, 6, 1), filter_index=read_int(slave, 0x8000, 0x15, 2))
@@ -399,6 +407,87 @@ class Hardware:
             self.master.sdo_read_timeout = previous_timeout
         self.previous_diagnostic = {r["position"]: {k:r.get(k) for k in ("errors","lost_link","watchdog")} for r in result}
         return dict(time_ns=time.perf_counter_ns(), duration_ms=(time.perf_counter_ns()-started)/1e6, slaves=result)
+
+
+    def parameter_poll_start(self):
+        """生成一轮只读任务；由通信循环每轮最多执行一个字段。"""
+        jobs = []
+        positions = {id(s): i+1 for i,s in enumerate(self.master.slaves)}
+        for slave, _ in self.ai_modules + self.ao_modules:
+            position = positions[id(slave)]
+            kind = "ai" if slave.id == EXPECTED[1][0] else "ao"
+            ident = f"s{position}:{slave.name}"
+            self.parameter_modes.setdefault(ident,None)
+            jobs.append(("sync", slave, ident, kind, None))
+            if kind == "ai":
+                jobs.append(("filter", slave, ident, kind, None))
+            else:
+                jobs.append(("watchdog", slave, ident, kind, None))
+                for index in range(4):
+                    jobs.append(("policy", slave, ident, kind, index))
+        self.parameter_jobs = iter(jobs)
+        self.parameter_polling = True
+
+    def parameter_poll_step(self):
+        if not getattr(self, "parameter_polling", False):
+            return None
+        try:
+            field, slave, ident, kind, index = next(self.parameter_jobs)
+        except StopIteration:
+            self.parameter_polling = False
+            return None
+        started = time.perf_counter_ns()
+        previous = getattr(self.master,"sdo_read_timeout",700000)
+        self.master.sdo_read_timeout = 2000
+        path = ("modules/"+ident+"/"+field if field in ("filter","watchdog") else ident+"/sync")
+        if field == "watchdog":
+            path = "modules/"+ident+"/watchdog_ms"
+        if field == "policy":
+            path = f"faults/policies/bus/{ident}:AO{index+1}"
+        value, error = None, None
+        try:
+            if field == "sync":
+                parameter = 0x1C33 if kind == "ai" else 0x1C32
+                raw = read_int(slave, parameter, 1, 2)
+                value = {0:"freerun",1:"sm",2:"dc",3:"dc"}.get(raw)
+                self.parameter_modes[ident] = value
+                for detail in self.hardware_details:
+                    if detail.get("id") == ident:
+                        detail["sync_mode"] = raw
+            elif field == "filter":
+                enabled = read_int(slave,0x8000,6,1)
+                code = read_int(slave,0x8000,0x15,2)
+                value = ("off" if not enabled else "fir50" if code == 0 else "fir60" if code == 1
+                         else f"iir{code-1}" if 2 <= code <= 9 else None)
+            elif field == "watchdog":
+                value = round(slave.get_watchdog("processdata"))
+            else:
+                from .calibration import calibrated, drive_voltage
+                channel = ident+f":AO{index+1}"
+                profile = (self.configuration or {}).get("channels",{}).get(channel,{})
+                action = read_int(slave,0x8000+16*index,5,1)
+                raw = read_int(slave,0x8000+16*index,0x13,2,True)
+                if action not in (0,2):
+                    raise ValueError("未知硬件看门狗模式")
+                target = calibrated(volts(raw),profile)
+                configured = (self.configuration or {}).get("faults",{}).get("policies",{}).get("bus",{}).get(channel,{})
+                if configured.get("action")=="value" and raw==raw_voltage(drive_voltage(configured.get("voltage",0),profile)):
+                    target = configured["voltage"]
+                is_zero = raw == raw_voltage(drive_voltage(0,profile))
+                value = dict(action="hold" if action == 2 else "zero" if is_zero else "value",
+                             voltage=0 if action == 2 or is_zero else target)
+        except Exception as exc:
+            error = str(exc)
+            if field == "sync":
+                self.parameter_modes[ident] = None
+        finally:
+            self.master.sdo_read_timeout = previous
+        result = dict(path=path,value=value,time_ns=time.perf_counter_ns(),
+                      duration_ms=(time.perf_counter_ns()-started)/1e6,error=error)
+        self.parameter_values[path] = value
+        modes = list(self.parameter_modes.values())
+        self.parameter_values["hardware/sync"] = modes[0] if modes and all(m == modes[0] for m in modes) else "mixed"
+        return result
 
     def exchange(self, values):
         if len(values) != len(self.channels["ao"]):

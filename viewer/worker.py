@@ -8,6 +8,7 @@ from .generator import DEFAULT_PERIOD_MS, TableWave, build_table, build_wave, ma
 from .hardware import Hardware, adapters
 from .pdo import raw_voltage, validated_voltage, volts
 from .settings import defaults, validate
+from .configuration import get_value
 
 LEASE_NS = 2_000_000_000
 PUBLISH_NS = 50_000_000
@@ -58,6 +59,9 @@ class Worker:
         self.desired = False
         self.reconnect_at = self.retry_index = 0
         self.web_lost_at = None
+        self.parameter_readback = {"values":{},"fields":{},"time_ns":None}
+        self.next_parameter_poll = 0
+        self.parameter_drift = set()
 
     @property
     def period_ns(self):
@@ -134,7 +138,8 @@ class Worker:
                     bad_count=self.bad_count, bad_duration_ms=(time.perf_counter_ns()-self.bad_since)/1e6 if self.bad_since else 0,
                     reconnect_at_ns=self.reconnect_at, desired_connected=self.desired,
                     diagnostic=self.diagnostic, hardware_details=getattr(self.bus,"hardware_details",[]) if self.bus else [],
-                    dc_error_ns=getattr(self, "dc_error_ns", None), diagnostic_ms=getattr(self,"diagnostic_ms",None))
+                    dc_error_ns=getattr(self, "dc_error_ns", None), diagnostic_ms=getattr(self,"diagnostic_ms",None),
+                    parameter_readback=dict(self.parameter_readback,connected=self.connection=="OP"))
 
     def lease_valid(self, generation, now):
         with self.lease.get_lock():
@@ -152,6 +157,69 @@ class Worker:
         self.period_ms = self.settings["hardware"]["period_ms"]
         self.period_revision += 1
 
+
+    def runtime_config(self, data):
+        checked = validate(data)
+        if self.bus:
+            if checked["modules"] != self.settings["modules"]:
+                raise ValueError("该参数需要清零并重连应用")
+            for channel in self.channels["ao"]:
+                ident = channel["id"]
+                if checked["channels"].get(ident,{}).get("calibration") != self.settings["channels"].get(ident,{}).get("calibration"):
+                    raise ValueError("输出校准需要清零并重连应用")
+            if (checked["hardware"]["sync"] != self.settings["hardware"]["sync"] or
+                    checked["faults"]["policies"]["bus"] != self.settings["faults"]["policies"]["bus"]):
+                raise ValueError("硬件同步或替代值需要清零并重连应用")
+            if getattr(self.bus,"dc_enabled",False) and checked["hardware"]["period_ms"] != self.period_ms:
+                raise ValueError("DC 周期需要清零并重连应用")
+        period = checked["hardware"]["period_ms"]
+        for channel,wave in self.wave.items():
+            if wave.frequency > max_frequency(period):
+                raise ValueError(f"AO{channel+1} 波形频率超过新周期上限 {max_frequency(period):g} Hz；原任务保持")
+        if period != self.period_ms:
+            self.period_ms = period
+            self.period_revision += 1
+        self.settings = checked
+        if self.bus:
+            self.bus.configuration = checked
+
+    def poll_parameters(self, now):
+        values = self.parameter_readback["values"]
+        for field in ("period_ms","receive_timeout_us"):
+            values["hardware/"+field] = self.settings["hardware"][field]
+        for field in ("consecutive","duration_ms","auto_reconnect","web_wait_ms"):
+            values["faults/"+field] = self.settings["faults"][field]
+        if not isinstance(self.bus,Hardware):
+            return
+        if now >= self.next_parameter_poll:
+            self.bus.parameter_poll_start()
+            self.next_parameter_poll = now+5_000_000_000
+        result = self.bus.parameter_poll_step()
+        if result:
+            self.parameter_readback["fields"][result["path"]] = result
+            self.parameter_readback["time_ns"] = result["time_ns"]
+            self.parameter_readback["last_duration_ms"] = result["duration_ms"]
+            values.update(self.bus.parameter_values)
+            path = result["path"].split("/")
+            if result["path"].endswith("/sync"):
+                expected = self.settings["hardware"]["sync"]
+            elif path[0] in ("modules","faults"):
+                expected = get_value(self.settings,path)
+            else:
+                return
+            if expected is None and path[:3] == ["faults","policies","bus"]:
+                expected = dict(action="zero",voltage=0)
+            mismatch = result["value"] != expected and expected not in (None,"current")
+            changed = result["path"] not in self.parameter_drift if mismatch else result["path"] in self.parameter_drift
+            if mismatch:
+                self.parameter_drift.add(result["path"])
+            else:
+                self.parameter_drift.discard(result["path"])
+            if changed:
+                self.event("设备参数回读与配置不一致" if mismatch else "设备参数回读已恢复",
+                           "alarm","warning" if mismatch else "info",
+                           parameter=result,expected=expected)
+
     def connect(self, interface):
         if self.bus:
             raise ValueError("请先断开")
@@ -164,10 +232,17 @@ class Worker:
         try:
             self.bus = Hardware(interface)
             expected_topology = self.settings["topology"]["fingerprint"]
-            if expected_topology and expected_topology != self.bus.fingerprint and (self.settings["startup"]["unattended"] or any(p.get("calibration",{}).get("enabled") for p in self.settings["channels"].values())):
+            if expected_topology and expected_topology != self.bus.fingerprint and (self.settings["startup"]["auto_connect"] or any(p.get("calibration",{}).get("enabled") for p in self.settings["channels"].values())):
                 raise ValueError("拓扑与保存配置不符，已禁止自动映射及校准，请人工核对")
+            from copy import deepcopy
+            connected = deepcopy(self.settings)
+            connected["topology"] = dict(channels=self.bus.channels,fingerprint=self.bus.fingerprint,devices=self.bus.devices)
+            self.settings = validate(connected)
             self.bus.configure(self.settings)
             self.devices, self.mapping, self.channels = self.bus.devices, self.bus.mapping, self.bus.channels
+            self.parameter_readback = {"values":{},"fields":{},"time_ns":None}
+            self.next_parameter_poll = 0
+            self.parameter_drift.clear()
             self.values = [0.0] * len(self.channels["ao"])
             self.confirmed = list(self.values)
             self.watchdog, self.expected = self.bus.watchdog, self.bus.expected
@@ -220,6 +295,8 @@ class Worker:
                 return self.bridge_command(ident, action, args, generation, now)
             if action == "configure":
                 self.configure(args["config"])
+            elif action == "runtime_config":
+                self.runtime_config(args["config"])
             elif action in ("link_fault", "runtime_fault"):
                 self.fault(args.get("reason", "链路故障"))
             elif action == "web_presence":
@@ -504,6 +581,7 @@ class Worker:
                     if now >= self.next_diagnostic and isinstance(self.bus,Hardware):
                         self.next_diagnostic = now+5_000_000_000
                         self.diagnostic = self.bus.diagnostic_snapshot()
+                    self.poll_parameters(now)
             except Exception as exc:
                 error = str(exc)
                 if not self.bad_count:

@@ -28,7 +28,8 @@ from .diagnostics import History, Journal
 from .hardware import adapters
 from .paths import data_root
 from .settings import Settings, validate
-from .system import login_status, set_login
+from .configuration import SettingError, get_value, make_plan, merge_cards
+from .system import login_status, set_login, open_config_directory
 from .timing import TimingWindow
 from .worker import run_worker
 
@@ -122,17 +123,133 @@ class Service:
         except Exception as exc:
             self.journal.log("runtime",f"无法请求通信故障策略：{exc}","error")
 
-    async def persist_bridge(self,data):
+    def set_bridge_configuration(self, data):
+        self.bridge.config = deepcopy(data)
+        by_id = {card["id"]:card for card in self.bridge.config["cards"]}
+        for ident,card in self.bridge.cards.items():
+            if ident in by_id:
+                card.config = by_id[ident]
+
+    async def persist_bridge(self, data, updates=None):
         async with self.config_lock:
             config = deepcopy(self.settings.data)
-            config["bridge"] = deepcopy(data)
-            await asyncio.to_thread(self.settings.save,config,config["revision"])
+            if updates is None:
+                config["bridge"] = deepcopy(data)
+            else:
+                for card in config["bridge"]["cards"]:
+                    for key,value in updates.get(card["id"],{}).items():
+                        if key not in ("saved_range","saved_divider"):
+                            raise ValueError("TCP 不允许保存该配置字段")
+                        card[key] = value
+            saved = await asyncio.to_thread(self.settings.save,config,config["revision"])
+            self.set_bridge_configuration(saved["bridge"])
+
+    async def save_bridge(self,data,base=None,revision=None):
+        async with self.config_lock:
+            if base is not None:
+                data = merge_cards(self.settings.data["bridge"],base,data)
+            elif revision is not None and revision != self.settings.data["revision"]:
+                raise ValueError("配置已更新，请重新读取后保存")
+            topology = self.status if self.status.get("fingerprint") else self.settings.data["topology"]
+            checked = validate_config(data,topology["channels"],topology["fingerprint"],
+                                      await asyncio.to_thread(local_addresses))
+            active = {c["id"]:c for c in checked["cards"]}
+            if any(active.get(ident) != card.config for ident,card in self.bridge.cards.items()):
+                raise ValueError("请先停止受影响的虚拟卡再修改配置")
+            config = deepcopy(self.settings.data)
+            config["bridge"] = checked
+            saved = await asyncio.to_thread(self.settings.save,config,config["revision"])
+            self.set_bridge_configuration(saved["bridge"])
+            return deepcopy(saved["bridge"])
+
+
+    def settings_plan(self, changes):
+        status = dict(self.status,bridge=self.bridge.status())
+        return make_plan(self.settings.data,changes,status)
+
+    async def apply_settings(self, changes, approved):
+        async with self.config_lock:
+            plan = self.settings_plan(changes)
+            wanted = [(c["path"],c["value"]) for c in plan["changes"]]
+            if not isinstance(approved,list) or any(not isinstance(c,dict) or not isinstance(c.get("path"),list) for c in approved):
+                raise SettingError("应用方案格式无效")
+            accepted = [(c.get("path"),c.get("value")) for c in approved]
+            if wanted != accepted:
+                raise SettingError("关联变化已更新，请重新查看应用方案", [c["path"] for c in plan["changes"]])
+            for change in approved:
+                actual = get_value(self.settings.data,change["path"])
+                if actual != change.get("base") and actual != change["value"]:
+                    raise SettingError("关联字段已被更新，请重新查看", [change["path"]])
+            if plan["noop"]:
+                return dict(config=deepcopy(self.settings.data),noop=True)
+            if self.operation and self.operation.get("state")=="running":
+                raise SettingError("请等待当前连接或参数操作完成", [c["path"] for c in changes])
+            config, before = plan["config"],deepcopy(self.settings.data)
+            generation = self.generation
+            touched_worker = False
+            login_changed = config["startup"]["login"] != before["startup"]["login"]
+            operation = dict(id=secrets.token_hex(8),state="running",message="正在应用所选参数",
+                             paths=[c["path"] for c in plan["changes"]])
+            self.operation = operation
+            try:
+                if plan["mode"]=="reconnect":
+                    self.critical_zero()
+                    generation = self.generation
+                    operation["message"] = "停止发布，确认全路零输出"
+                    await self.bridge.stop("参数应用：清零并重连")
+                    await self.bridge_request("zero",{})
+                    if generation != self.generation:
+                        raise ValueError("人工清零已优先执行，本次参数应用取消")
+                    await self.bridge_request("disconnect",{})
+                    self.record_stop()
+                    operation["message"] = "应用硬件参数并重新建立零输出连接"
+                    touched_worker = True
+                    await self.bridge_request("configure",dict(config=config))
+                    result = await self.bridge_request("connect",dict(interface=config["hardware"]["interface"]))
+                    self.status.update(result or {})
+                elif plan["mode"]=="live":
+                    touched_worker = True
+                    result = await self.bridge_request("runtime_config",dict(config=config))
+                    self.status.update(result or {})
+                else:
+                    touched_worker = True
+                    result = await self.bridge_request("configure",dict(config=config))
+                    self.status.update(result or {})
+                if generation != self.generation:
+                    raise ValueError("人工清零已优先执行，本次参数未保存")
+                if login_changed:
+                    await asyncio.to_thread(set_login,config["startup"]["login"])
+                saved = await asyncio.to_thread(self.settings.save,config,before["revision"])
+                self.set_bridge_configuration(saved["bridge"])
+                operation.update(state="done",message="参数已应用并回读" if plan["mode"]=="reconnect" else "参数已保存")
+                self.journal.log("control","逐项应用参数",paths=operation["paths"],mode=plan["mode"],revision=saved["revision"])
+                return dict(config=saved,noop=False,mode=plan["mode"])
+            except Exception as exc:
+                if touched_worker:
+                    try:
+                        if plan["mode"]=="reconnect":
+                            await self.bridge_request("disconnect",{})
+                            await self.bridge_request("configure",dict(config=before))
+                        elif generation==self.generation:
+                            await self.bridge_request("runtime_config" if self.status.get("connection")=="OP" else "configure",dict(config=before))
+                    except Exception as rollback:
+                        self.journal.log("runtime","参数回退无法确认","error",reason=str(rollback))
+                if login_changed:
+                    try:
+                        await asyncio.to_thread(set_login,before["startup"]["login"])
+                    except Exception as rollback:
+                        self.journal.log("control","登录启动项回退无法确认","error",reason=str(rollback))
+                operation.update(state="failed",message=str(exc))
+                self.journal.log("control","参数应用失败","error",paths=operation["paths"],reason=str(exc))
+                raise SettingError(str(exc),operation["paths"]) from exc
 
     async def save_config(self,data,revision):
         async with self.config_lock:
             config = validate(data)
             if revision != self.settings.data["revision"]:
                 raise ValueError("配置已更新，请重新读取后保存")
+            if config == self.settings.data:
+                return deepcopy(self.settings.data)
             topology = config["topology"]
             if config["bridge"].get("cards"):
                 config["bridge"] = validate_config(config["bridge"],topology["channels"],topology["fingerprint"],
@@ -141,7 +258,7 @@ class Service:
                 by_id = {c["id"]:c for c in config["bridge"]["cards"]}
                 if any(by_id.get(i) != c.config for i,c in self.bridge.cards.items()):
                     raise ValueError("请先停止受影响的虚拟卡再保存")
-            hardware_changed = any(config[k] != self.settings.data[k] for k in ("hardware","faults","channels"))
+            hardware_changed = any(config[k] != self.settings.data[k] for k in ("hardware","modules","faults","channels"))
             if hardware_changed:
                 if self.status.get("connection") not in ("DISCONNECTED","FAULT") or self.status.get("desired_connected"):
                     raise ValueError("硬件、校准或故障配置已改变，请先断开接口再保存应用")
@@ -157,7 +274,7 @@ class Service:
                 if config["startup"]["login"] != old_login:
                     await asyncio.to_thread(set_login,old_login)
                 raise
-            self.bridge.config = deepcopy(saved["bridge"])
+            self.set_bridge_configuration(saved["bridge"])
             self.journal.log("control","配置已保存",revision=saved["revision"])
             return saved
 
@@ -248,10 +365,10 @@ class Service:
     async def supervise(self):
         self.heartbeat()
         await self.bridge_request("configure",dict(config=self.settings.data))
-        if self.settings.data["startup"]["unattended"] and not self.settings.error:
+        if self.settings.data["startup"]["auto_connect"] and not self.settings.error:
             interface = self.settings.data["hardware"]["interface"]
             if interface:
-                self.publish_intent = True
+                self.publish_intent = [c["id"] for c in self.settings.data["bridge"]["cards"] if c["enabled"] and c.get("start_on_boot")]
                 await self.begin_connect(interface)
         retry_at = 0
         while True:
@@ -275,11 +392,20 @@ class Service:
                 try:
                     if self.bridge.suspended:
                         await self.bridge.resume(self.status)
-                    elif self.publish_intent and not self.bridge.active:
-                        await self.bridge.start(self.status)
-                        for ident in self.bridge.cards:
-                            await self.bridge.authorize(ident)
-                        self.publish_intent = False
+                    elif self.publish_intent:
+                        selected,self.publish_intent = list(self.publish_intent),False
+                        generation = self.generation
+                        for ident in selected:
+                            if self.manual_lock or generation != self.generation:
+                                break
+                            source = next((c for c in self.settings.data["bridge"]["cards"] if c["id"]==ident),None)
+                            try:
+                                await self.bridge.start(self.status,ident)
+                                if source and source.get("authorize_on_boot") and not self.manual_lock:
+                                    await self.bridge.authorize(ident)
+                            except (ValueError,OSError,HTTPException) as exc:
+                                self.bridge.last_error = str(exc)
+                                self.journal.log("connection",f"虚拟卡 {ident} 冷启动失败：{exc}","error")
                 except (ValueError,OSError,HTTPException) as exc:
                     self.publish_intent = False
                     self.bridge.last_error = str(exc)
@@ -418,6 +544,13 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware,allowed_hosts=["127.0.0.1"])
 app.mount("/static",StaticFiles(directory=STATIC),name="static")
 
+@app.middleware("http")
+async def revalidate_ui(request, call_next):
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
 @app.get("/")
 async def index():
     return FileResponse(STATIC/"index.html")
@@ -454,7 +587,9 @@ async def bridge_network():
 @app.get("/api/config")
 async def config(request:Request):
     service = request.app.state.service
-    return dict(config=service.settings.data,error=service.settings.error,login=await asyncio.to_thread(login_status))
+    return dict(config=service.settings.data,error=service.settings.error,login=await asyncio.to_thread(login_status),
+                path=str(service.settings.path),backup=str(service.settings.path.with_suffix(".backup.json")),
+                readback=service.status.get("parameter_readback",{}),capabilities=service.status.get("hardware_details",[]))
 
 @app.get("/api/diagnostics/history")
 async def history(request:Request,start:float|None=None,end:float|None=None,limit:int=4000):
@@ -498,7 +633,20 @@ async def commands(command:Command,request:Request):
     service.heartbeat()
     try:
         extra = {}
-        if action == "config_save":
+        if action == "preview_settings":
+            plan = service.settings_plan(args["changes"])
+            return dict(id=command.id,ok=True,plan={k:v for k,v in plan.items() if k!="config"})
+        elif action == "apply_settings":
+            extra.update(await service.apply_settings(args["changes"],args.get("approved")))
+        elif action == "open_config_directory":
+            await asyncio.to_thread(open_config_directory)
+        elif action == "set_period":
+            changes = [dict(path=["hardware","period_ms"],base=service.settings.data["hardware"]["period_ms"],value=args["period_ms"])]
+            plan = service.settings_plan(changes)
+            if plan["mode"]=="reconnect":
+                raise ValueError("该修改需要清零重连，请使用逐项应用入口")
+            extra.update(await service.apply_settings(changes,plan["changes"]))
+        elif action == "config_save":
             extra["config"] = await service.save_config(args["config"],args["revision"])
         elif action == "calibration_two_point":
             extra["calibration"] = two_point(*(args[k] for k in ("x1","y1","x2","y2")))
@@ -508,10 +656,7 @@ async def commands(command:Command,request:Request):
         elif action == "bridge_preset":
             extra["config"] = service.bridge.make_preset(args["profile"],service.status)
         elif action == "bridge_save":
-            if "revision" in args and args["revision"] != service.settings.data["revision"]:
-                raise ValueError("配置已更新，请重新读取后保存")
-            topology = service.status if service.status.get("fingerprint") else service.settings.data["topology"]
-            extra["config"] = await service.bridge.configure(args["config"],topology)
+            extra["config"] = await service.save_bridge(args["config"],args.get("base_config"),args.get("revision"))
         elif action == "bridge_start":
             service.manual_lock = False
             await service.bridge.start(service.status,args.get("card"))
@@ -555,12 +700,15 @@ async def commands(command:Command,request:Request):
                 if action=="arm":
                     service.manual_lock = False
         if action not in ("claim","calibration_two_point"):
-            service.journal.log("control",f"管理操作：{action}",operation=action,channels=args.get("channels"))
+            labels = {"connect":"连接接口","disconnect":"断开接口","zero":"全部清零并锁定","arm":"允许网页控制","lock_channel":"清零并锁定通道","set_output":"应用输出目标","wave":"启动波形","stop_wave":"停波清零","record_start":"开始记录","record_stop":"停止记录","bridge_save":"保存虚拟卡配置","bridge_start":"开始监听虚拟卡","bridge_stop":"停止虚拟卡","bridge_authorize":"授权 TCP 控制","apply_settings":"应用参数","config_save":"保存配置","open_config_directory":"打开配置文件夹"}
+            service.journal.log("control",labels.get(action,"管理操作"),operation=action,channels=args.get("channels"))
         result = dict(id=command.id,ok=True,result=service.status_for(token),**extra)
         service.command_results[key] = result
         if len(service.command_results)>256:
             service.command_results.pop(next(iter(service.command_results)))
         return result
+    except SettingError as exc:
+        raise HTTPException(409,dict(message=str(exc),paths=exc.paths)) from exc
     except (ValueError,OSError,KeyError) as exc:
         raise HTTPException(409,str(exc)) from exc
 
