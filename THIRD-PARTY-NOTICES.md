@@ -10,7 +10,7 @@ PySOEM 1.1.13 使用 MIT 许可证。其 Windows wheel 静态编入 SOEM 代码�
 
 ## 二、网页和打包依赖
 
-仪表盘内置 uPlot 1.6.32，版权和许可见 [uPlot 许可证](viewer/static/vendor/LICENSE)。EXE 解包时包含 Python 与随包收集到的依赖许可，许可文件位于运行资源的 `licenses/` 目录。
+仪表盘内置 uPlot 1.6.32，版权和许可见 [uPlot 许可证](viewer/static/vendor/LICENSE)。刷新图标使用 Lucide 的 rotate-cw SVG，按 ISC 许可证提供，原图和完整许可保存在 [vendor/lucide](viewer/static/vendor/lucide/)，来源为 [Lucide 官方源码](https://github.com/lucide-icons/lucide/blob/main/icons/rotate-cw.svg)。EXE 解包时包含 Python 与随包收集到的依赖许可，许可文件位于运行资源的 `licenses/` 目录。
 
 ## 三、系统驱动
 
@@ -25,3 +25,5 @@ PySOEM 1.1.13 使用 MIT 许可证。其 Windows wheel 静态编入 SOEM 代码�
 - EL4134：[官方产品页](https://www.beckhoff.com/en-us/products/i-o/ethercat-terminals/el-ed4xxx-analog-output/el4134.html) · [图片来源](https://multimedia.beckhoff.com/media/el4134_es4134__web_preview.png)
 
 文件位于 viewer/static/images/modules/，未使用在线运行依赖。
+
+中瑞 E1682 产品缩略图来自厂家提供的《E1682_说明书_V1.0.1.pdf》封面，版权归原权利人所有。保留原图透明蒙版，随程序离线保存于 viewer/static/images/modules/e1682.png；原始手册不随仓库分发。原版和扩展虚拟卡共用此识别图片，扩展卡以“扩展 v1”文字区分，不表示存在对应的新型号实物。
