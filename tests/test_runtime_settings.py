@@ -326,3 +326,20 @@ def test_malformed_json_structure_recovers_without_crashing(tmp_path,monkeypatch
     (tmp_path/"settings.json").write_text(json.dumps(config),encoding="utf-8")
     loaded=Settings()
     assert loaded.error and not loaded.data["startup"]["unattended"]
+
+
+def test_history_export_uses_stable_batches_during_collection():
+    history=History()
+    now=time.perf_counter_ns()
+    sample=dict(time_ns=now,interval_ms=10,roundtrip_ms=.1,period_ms=10,wkc=3,expected_wkc=3,session=1)
+    history.add([sample])
+    class CollectDuringRead(list):
+        once=True
+        def __getitem__(self,key):
+            if self.once:
+                self.once=False
+                history.add([dict(sample,time_ns=now+10000000)])
+            return super().__getitem__(key)
+    history.chunks[0]=CollectDuringRead(history.chunks[0])
+    data=history.query(history.offset+now/1e6-1,history.offset+now/1e6+100,32)
+    assert len(data["rows"])==1 and len(history.chunks)==2

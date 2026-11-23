@@ -56,7 +56,8 @@ class History:
                 if good:
                     indices.update((min(good, key=lambda i:group[i][key]), max(good, key=lambda i:group[i][key])))
             selected.extend(group[i] for i in sorted(indices))
-        for chunk in self.chunks:
+        # 导出在线程中执行；固定已发布的不可变批次，避免采集中修改 deque。
+        for chunk in tuple(self.chunks):
             if chunk[-7] < start or chunk[0] > end:
                 continue
             for offset in range(0, len(chunk), 7):
