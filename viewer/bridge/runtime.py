@@ -28,6 +28,7 @@ class Card:
         self.sessions = set()
         self.controller = None
         self.authorized = False
+        self.ever_authorized = False
         self.last_error = ""
         self.last_stats = {}
 
@@ -48,10 +49,18 @@ class Bridge:
         self.seen_tcp = False
         self.persist_lock = asyncio.Lock()
         self.close_tasks = set()
+        self.server_cards = {}
+        self.suspended = False
+        self.persist_callback = None
+        self.event_callback = None
+        self.fault_callback = None
+        self.fault_pending = False
 
     def log(self, message):
         self.events.append(dict(time=time.time(), message=message))
         console_message("TCP 桥接 · " + message)
+        if self.event_callback:
+            self.event_callback("control", "TCP 桥接 · " + message)
         try:
             target = data_root() / "logs" / "bridge-events.jsonl"
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -62,10 +71,15 @@ class Bridge:
 
     async def configure(self, data, status):
         if self.active:
-            raise ValueError("请先停止发布再修改配置")
+            by_id = {c["id"]: c for c in data.get("cards", [])}
+            if any(by_id.get(ident) != card.config for ident, card in self.cards.items()):
+                raise ValueError("请先停止受影响的虚拟卡再修改配置")
         addresses = await asyncio.to_thread(local_addresses)
         self.config = validate_config(data, status.get("channels", {}), status.get("fingerprint"), addresses)
-        await asyncio.to_thread(save_config, self.config)
+        if self.persist_callback:
+            await self.persist_callback(self.config)
+        else:
+            await asyncio.to_thread(save_config, self.config)
         self.last_error = ""
         return self.config
 
@@ -74,46 +88,74 @@ class Bridge:
             raise ValueError("请先连接实机并选择有效模板")
         return preset(status["channels"], status["fingerprint"], profile)
 
-    async def start(self, status):
-        if self.active:
-            raise ValueError("已经在监听")
+    def writable(self, config):
+        permissions = config.get("ao_writable", [True]*len(config["ao"]))
+        return [self.index("ao", x) for x, allowed in zip(config["ao"], permissions) if x is not None and allowed]
+
+    async def start(self, status, card_id=None):
         if status.get("connection") != "OP" or not status.get("ready"):
             raise ValueError("请先连接实机并等待通信稳定")
         self.channels = status["channels"]
-        config = validate_config(self.config, self.channels, status["fingerprint"],
-                                 await asyncio.to_thread(local_addresses))
+        config = validate_config(self.config, self.channels, status["fingerprint"], await asyncio.to_thread(local_addresses))
         self.config = config
-        selected = [c for c in config["cards"] if c["enabled"]]
+        selected = [c for c in config["cards"] if c["enabled"] and c["id"] not in self.cards and (card_id is None or c["id"] == card_id)]
         if not selected:
-            raise ValueError("没有已启用的虚拟卡")
-        self.cards = {c["id"]: Card(c) for c in selected}
-        servers = []
+            raise ValueError("没有尚未监听的启用虚拟卡")
+        pending = []
         try:
             for c in selected:
-                server = await asyncio.start_server(
-                    lambda r, w, ident=c["id"]: self.accept(ident, r, w), c["host"], c["port"],
-                    start_serving=False, limit=p.MAX_PAYLOAD+32, reuse_address=False)
-                servers.append(server)
-            self.active = True
+                server = await asyncio.start_server(lambda r,w,ident=c["id"]: self.accept(ident,r,w),
+                                                   c["host"],c["port"],start_serving=False,limit=p.MAX_PAYLOAD+32,reuse_address=False)
+                pending.append((c,server))
+            if not self.active:
+                await self.request("bridge_setup", {"cards": [dict(id=c["id"],outputs=self.writable(c)) for c in selected]})
+            else:
+                for c in selected:
+                    await self.request("bridge_add", {"definition": dict(id=c["id"],outputs=self.writable(c))})
+            self.active, self.stopping, self.suspended = True,False,False
             self.seen_tcp = False
-            self.stopping = False
-            await self.request("bridge_setup", {"cards": [
-                {"id": c["id"], "outputs": [self.index("ao", x) for x in c["ao"] if x is not None]}
-                for c in selected]})
-            self.servers = servers
             self.source_status = status
-            self.samples.clear()
-            for server in servers:
+            for c,server in pending:
+                self.cards[c["id"]] = Card(c)
+                self.server_cards[c["id"]] = server
+                self.servers.append(server)
                 await server.start_serving()
+                if not self.writable(c):
+                    await self.authorize(c["id"])
             self.last_error = ""
-            self.log(f"开始监听 {len(servers)} 张虚拟卡；输出等待网页授权")
+            self.log(f"开始监听 {len(pending)} 张虚拟卡；可写通道等待授权")
         except Exception:
-            self.active = False
-            for server in servers:
+            for _c,server in pending:
                 server.close()
                 await server.wait_closed()
-            self.critical()
             raise
+
+    async def resume(self, status):
+        if not self.active or not self.suspended or not status.get("ready"):
+            return
+        await self.request("bridge_setup", {"cards": [dict(id=c.config["id"],outputs=self.writable(c.config)) for c in self.cards.values()]})
+        self.suspended = False
+        self.seen_tcp = False
+        for ident,card in self.cards.items():
+            if card.ever_authorized and card.config.get("auto_reauthorize",True):
+                await self.authorize(ident)
+        self.log("通信恢复，零输出确认后等待新的客户端指令")
+
+    async def stop_card(self, ident):
+        card = self.cards.get(ident)
+        if card is None:
+            return
+        card.ever_authorized = False
+        server = self.server_cards.pop(ident)
+        server.close()
+        await server.wait_closed()
+        self.servers.remove(server)
+        await asyncio.gather(*(s.close("本卡停止发布",release=False) for s in tuple(card.sessions)),return_exceptions=True)
+        if not self.suspended:
+            await self.request("bridge_disable",dict(card=ident))
+        self.cards.pop(ident,None)
+        self.active = bool(self.cards)
+        self.log(f"{card.config['name']} 已停止；仅本卡可写 AO 清零")
 
     def index(self, kind, ident):
         return next(i for i, c in enumerate(self.channels[kind]) if c["id"] == ident)
@@ -123,6 +165,7 @@ class Bridge:
             raise ValueError("虚拟卡未监听")
         await self.request("bridge_authorize", {"card": ident})
         self.cards[ident].authorized = True
+        self.cards[ident].ever_authorized = True
         self.cards[ident].last_error = ""
         self.log(f"{self.cards[ident].config['name']} 已授权接管")
 
@@ -137,18 +180,20 @@ class Bridge:
         for server in self.servers:
             await server.wait_closed()
         self.servers = []
+        self.server_cards = {}
         sessions = [s for c in self.cards.values() for s in c.sessions]
         await asyncio.gather(*(s.close(reason, release=False) for s in sessions), return_exceptions=True)
         if was_active and not shutdown:
-            self.critical()
             try:
-                await self.request("zero", {})
+                await self.request("bridge_stop", {})
             except Exception as exc:
                 self.last_error = f"{reason}；清零结果：{exc}"
         for card in self.cards.values():
             card.authorized = False
         if was_active:
             self.log(reason)
+        self.cards = {}
+        self.suspended = False
         self.stopping = False
 
     async def accept(self, ident, reader, writer):
@@ -157,6 +202,7 @@ class Bridge:
         permitted = peer and any(ipaddress.ip_address(peer[0]) in ipaddress.ip_network(n)
                                  for n in card.config["allow"])
         if (not self.active or not permitted or len(card.sessions) >= 32 or
+                self.suspended or not self.source_status.get("ready", True) or
                 (card.config["profile"] == "legacy" and card.controller is not None)):
             writer.close()
             await writer.wait_closed()
@@ -167,7 +213,10 @@ class Bridge:
 
     async def persist(self):
         async with self.persist_lock:
-            await asyncio.to_thread(save_config, self.config)
+            if self.persist_callback:
+                await self.persist_callback(self.config)
+            else:
+                await asyncio.to_thread(save_config, self.config)
 
     def feed(self, status, samples):
         self.source_status = status
@@ -175,7 +224,8 @@ class Bridge:
             self.latest_sample = samples[-1]
         for sample in samples:
             stamp = sample.get("host_send_ns") or sample["time_ns"]
-            self.samples.append(stamp)
+            if sample.get("ao_valid", True):
+                self.samples.append(stamp)
             self.last_source_ns = stamp
         if self.samples:
             cutoff = self.samples[-1] - 10_000_000_000
@@ -196,7 +246,18 @@ class Bridge:
         if not self.seen_tcp and status.get("connection") == "OP":
             return
         if status.get("connection") != "OP" or status.get("control_mode") != "TCP":
-            self.fault("EtherCAT 或控制租约中断")
+            if not self.suspended:
+                self.suspended = True
+                for card in self.cards.values():
+                    card.authorized = False
+                    for session in tuple(card.sessions):
+                        session.stop_stream()
+                        if session.owner:
+                            task = asyncio.create_task(session.close("总线故障，等待恢复", release=False))
+                            self.close_tasks.add(task)
+                            task.add_done_callback(self.close_tasks.discard)
+            return
+        if self.suspended:
             return
         for card in self.cards.values():
             for session in tuple(card.sessions):
@@ -214,6 +275,16 @@ class Bridge:
         task.add_done_callback(self.close_tasks.discard)
 
     def fault(self, reason):
+        if self.fault_callback and self.active and not self.stopping:
+            if not self.fault_pending:
+                self.fault_pending = True
+                async def report_fault():
+                    try:
+                        await self.fault_callback(reason)
+                    finally:
+                        self.fault_pending = False
+                asyncio.create_task(report_fault())
+            return
         if self.active and not self.stopping:
             self.last_error = reason
             self.critical()
@@ -241,7 +312,7 @@ class Bridge:
             result.append(dict(id=config["id"], name=config["name"], profile=config["profile"],
                                address=f"{config['host']}:{config['port']}", authorized=card.authorized,
                                controller=card.controller.peer if card.controller else None,
-                               connections=len(card.sessions), error=card.last_error, physical_ao=outputs,
+                               connections=len(card.sessions), error=card.last_error, physical_ao=outputs, ao_writable=config.get("ao_writable"),
                                sessions=[s.summary() for s in card.sessions], last_stats=card.last_stats))
         source = {key: self.source_status.get(key) for key in (
             "connection", "control_mode", "ready", "period_ms", "expected_wkc", "watchdog_ms",
@@ -251,7 +322,7 @@ class Bridge:
                       age_ms=(time.perf_counter_ns()-self.last_source_ns)/1e6 if self.last_source_ns else None,
                       interval_ms=self.latest_sample.get("interval_ms") if fresh else None,
                       roundtrip_ms=self.latest_sample.get("roundtrip_ms") if fresh else None)
-        return dict(active=self.active, last_error=self.last_error, cards=result, source=source,
+        return dict(active=self.active, suspended=self.suspended, last_error=self.last_error, cards=result, source=source,
                     native_hz=self.native_hz if fresh else None, events=list(self.events), config=self.config,
                     source_batch_ms=50, timestamp_source="host_pdo_exchange")
 
@@ -290,6 +361,7 @@ class Session:
         self.tables = {}
         self.wave_info = []
         self.table_rate = 2000
+        self.paused = False
         self.subscribed = False
         self.last_command = None
         self.last_stats = {}
@@ -307,6 +379,8 @@ class Session:
             return
         if self.card.controller is not None:
             raise ValueError("该卡已有控制客户端")
+        if not self.card.authorized and self.card.ever_authorized and self.card.config.get("auto_reauthorize", True):
+            await self.bridge.authorize(self.card.config["id"])
         await self.request("bridge_claim")
         self.card.controller = self
         self.owner = True
@@ -477,6 +551,13 @@ class Session:
         self.frame_sequence = self.sent_samples = self.sent_frames = 0
         self.last_flush = time.monotonic()
 
+    def pause_stream(self):
+        if self.sampler:
+            self.sampler.pause()
+        self.pending_data.clear()
+        self.pending_first_ns = None
+        self.paused = True
+
     def feed(self, samples):
         if self.failed or not self.sampler:
             return
@@ -485,6 +566,10 @@ class Session:
                 break
             if Sampler.stamp(sample) < self.stream_started_ns:
                 continue
+            if sample.get("health") == "TOLERATING" or any(not sample["valid"][i] for group in self.sampler.mappings for i,_ in group):
+                self.pause_stream()
+                continue
+            self.paused = False
             for data, count, meta in self.sampler.feed(sample):
                 self.latency_ms = max(0, (time.perf_counter_ns()-meta["logical_start_ns"])/1e6)
                 if self.legacy:
@@ -505,6 +590,8 @@ class Session:
                             self.stop_stream(discard=False)
                             break
                 else:
+                    meta["engineering"] = [sample.get("engineering", [])[self.bridge.index("ai", self.card.config["ai"][ch])] if self.card.config["ai"][ch] and self.bridge.index("ai", self.card.config["ai"][ch]) < len(sample.get("engineering", [])) else None for ch in self.stream_channels]
+                    meta["channel_profiles"] = {ident:self.bridge.source_status.get("channel_profiles",{}).get(ident,{}) for ident in self.card.config["ai"] if ident}
                     meta.update(sample_count=count, channel_count=len(self.stream_channels),
                                 channels=self.stream_channels, encoding="i16le", sequence=self.sent_frames+1)
                     if not self.block:
@@ -518,7 +605,7 @@ class Session:
                         break
                 if len(self.block) > 512*1024:
                     self.flush()
-        if time.monotonic()-self.last_flush >= self.card.config["send_ms"]/1000:
+        if not self.paused and time.monotonic()-self.last_flush >= self.card.config["send_ms"]/1000:
             self.flush()
 
     def flush(self):
@@ -534,6 +621,8 @@ class Session:
         for channel in channels:
             if type(channel) is not int or not 1 <= channel <= len(self.card.config["ao"]):
                 raise ValueError("虚拟 AO 编号无效，输出从 1 开始")
+            if not self.card.config.get("ao_writable", [True]*len(self.card.config["ao"]))[channel-1]:
+                raise ValueError("该虚拟 AO 为只读映射，不能写入")
             ident = self.card.config["ao"][channel-1]
             if ident is None:
                 raise ValueError("该 AO 未映射")
@@ -678,7 +767,8 @@ class Session:
                 await self.claim()
             elif opcode == p.RELEASE:
                 if self.owner:
-                    await self.request("bridge_release")
+                    await self.request("bridge_release", safe=True)
+                    self.card.ever_authorized = False
                     self.owner = False
                     self.card.controller = None
                     self.card.authorized = False

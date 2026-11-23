@@ -1,120 +1,64 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>EtherCAT Viewer</title>
-  <link rel="stylesheet" href="/static/vendor/uPlot.min.css">
-  <link rel="stylesheet" href="/static/style.css">
-  <script defer src="/static/vendor/uPlot.iife.min.js"></script>
-  <script defer src="/static/charts.js"></script>
-  <script defer src="/static/bridge.js"></script>
-  <script defer src="/static/app.js"></script>
-  <script defer src="/static/reference.js"></script>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EtherCAT Viewer · 设备管理</title>
+<link rel="stylesheet" href="/static/vendor/uPlot.min.css"><link rel="stylesheet" href="/static/style.css">
+<script defer src="/static/vendor/uPlot.iife.min.js"></script><script defer src="/static/charts.js"></script>
+<script defer src="/static/bridge.js"></script><script defer src="/static/settings.js"></script><script defer src="/static/diagnostics.js"></script><script defer src="/static/app.js"></script>
 </head>
 <body>
-  <header class="top">
-    <div class="brand"><span class="badge" aria-hidden="true"><i></i><i></i><i></i><i></i></span><h1>EtherCAT Viewer</h1></div>
-    <span id="connection" class="connection" role="status">掉线</span>
-  </header>
-  <main>
-    <section class="toolbar" aria-label="连接与输出管理">
-      <div class="group">
-        <label for="adapters">EtherCAT 接口</label>
-        <select id="adapters"><option value="">读取网卡中…</option></select>
-        <button id="refresh">刷新</button>
-        <button id="claim">取得控制权</button>
-        <button class="primary" id="connect">连接实机</button>
-        <button id="disconnect">断开</button>
-      </div>
-      <div class="group">
-        <span id="lock">输出已锁定</span>
-        <button id="arm">解锁输出</button>
-        <button class="danger" id="zero">清零并锁定</button>
-      </div>
-    </section>
-    <p id="message" role="status" hidden></p>
-    <section class="panel bridge-panel" aria-labelledby="bridge-title">
-      <div class="section-head">
-        <div><h2 id="bridge-title">中瑞协议桥接</h2><p id="bridge-mode">网页调试</p></div>
-        <button class="danger" id="bridge-reclaim">清零并收回控制权</button>
-      </div>
-      <p id="bridge-source" class="muted"></p>
-      <p>原版兼容端口供现有软件使用，扩展 v1 提供更多通道、时间戳及只读观察。未映射 AI 固定为零。逻辑采样率和真实更新率分别统计。</p>
-      <div class="group">
-        <button id="bridge-legacy">原版卡预设</button>
-        <button id="bridge-extended">扩展卡预设</button>
-        <button id="bridge-add">增加虚拟卡</button>
-        <button id="bridge-verify">按当前拓扑重新核对</button>
-        <button id="bridge-save">保存配置</button>
-        <button class="primary" id="bridge-start">开始监听</button>
-        <button id="bridge-stop">停止发布并清零</button>
-      </div>
-      <p id="bridge-error" class="mapping-warning" role="status"></p>
-      <p id="bridge-config-state" class="muted"></p>
-      <div id="bridge-config"></div>
-      <div id="bridge-runtime"></div>
-      <details><summary>桥接最近事件</summary><pre id="bridge-events"></pre></details>
-    </section>
-    <section class="scope" aria-labelledby="scope-title">
-      <div class="section-head">
-        <div><h2 id="scope-title">实时波形</h2><p>时间 / s · 电压 / V · 滚轮缩放 · 拖拽框选</p></div>
-        <div class="group">
-          <select id="module-filter" aria-label="查看模块"><option value="">全部模块</option></select>
-          <span id="time-window">30.0 s · 实时</span>
-          <button id="zoom-in" aria-label="缩短时间窗">− 时间窗</button>
-          <button id="zoom-out" aria-label="延长时间窗">+ 时间窗</button>
-          <button id="follow">回到实时</button>
-        </div>
-      </div>
-      <h3>模拟量输出 <span>已获通信回执的下发值</span></h3>
-      <div class="chart-grid" id="outputs"></div>
-      <h3>模拟量输入 <span>采集电压</span></h3>
-      <div class="chart-grid" id="inputs"></div>
-    </section>
-    <section class="diagnostic panel" aria-labelledby="diag-title">
-      <div class="section-head">
-        <div><h2 id="diag-title">通信诊断</h2><p id="bus-summary">等待实机连接</p></div>
-        <div class="group">
-          <button id="record">开始记录</button><a class="button" id="export" href="/api/recording" hidden>下载 CSV</a>
-        </div>
-      </div>
-      <dl class="metrics">
-        <div><dt>目标周期</dt><dd id="target-metric">10 ms</dd></div>
-        <div><dt>实际周期间隔</dt><dd id="interval-metric">—</dd></div>
-        <div><dt>主站收发耗时</dt><dd id="roundtrip-metric">—</dd></div>
-        <div><dt>实际更新率</dt><dd id="rate-metric">—</dd></div>
-        <div><dt>WKC 实际 / 预期</dt><dd id="wkc">—</dd></div>
-        <div><dt>通信异常</dt><dd id="error-metric">0</dd></div>
-        <div><dt>调度漏期</dt><dd id="missed-metric">0</dd></div>
-      </dl>
-      <div class="diagnostic-body">
-        <form id="period-form" class="group"><label for="period">通信周期</label>
-          <input id="period" type="number" min="1" max="50" step="1" value="10" required><span>ms</span><button>应用周期</button>
-        </form>
-        <p id="fault-detail" role="status"></p>
-        <details><summary>最近 10 秒统计与从站详情</summary>
-          <p>周期间隔是相邻两次交换的起始间隔，收发耗时是单次主站发送至接收返回的时间。WKC 是处理回执，实际值与当前拓扑的预期值一致，表示本轮所需读写均获确认（现有三从站为 3 / 3）。−1 表示未收到回应。</p>
-          <div class="table-wrap"><table><thead><tr><th>指标</th><th>最新</th><th>中位数</th><th>P95</th><th>最大</th><th>样本</th></tr></thead><tbody id="timing-details"></tbody></table></div>
-          <p id="viewer-drops"></p>
-          <div class="table-wrap"><table><thead><tr><th>从站</th><th>厂商 / 产品</th><th>Revision</th><th>AL 状态</th><th>状态码</th></tr></thead><tbody id="devices"></tbody></table></div>
-          <p id="input-details"></p><pre id="mapping-text" hidden></pre>
-        </details>
-      <details class="reference">
-        <summary>万用表记录与校准参数</summary>
-        <p>测量值与参数保存在当前浏览器。当前曲线和输出使用设备原始量程换算。</p>
-        <form id="reference-form">
-          <table>
-            <thead><tr><th>通道</th><th>零指令实测 / mV</th><th>增益</th><th>偏移 / V</th></tr></thead>
-            <tbody>
-              <tr><td>AO1</td><td><input name="zero1" aria-label="AO1 零指令实测" type="number" step="any" required></td><td><input name="gain1" aria-label="AO1 增益" type="number" min="0.001" step="any" required></td><td><input name="offset1" aria-label="AO1 偏移" type="number" step="any" required></td></tr>
-              <tr><td>AO4</td><td><input name="zero4" aria-label="AO4 零指令实测" type="number" step="any" required></td><td><input name="gain4" aria-label="AO4 增益" type="number" min="0.001" step="any" required></td><td><input name="offset4" aria-label="AO4 偏移" type="number" step="any" required></td></tr>
-            </tbody>
-          </table>
-          <button type="submit">保存参数</button> <span id="reference-saved" role="status"></span>
-        </form>
-      </details>
-    </section>
-  </main>
-</body>
-</html>
+<header class="top"><div class="brand"><span class="badge" aria-hidden="true"><i></i><i></i><i></i><i></i></span><div><h1>EtherCAT Viewer</h1><p class="muted">设备连接 · 波形调试 · 中瑞协议桥接</p></div></div><div class="group"><span id="connection" class="connection" role="status">等待本地服务</span><span id="overview" class="muted"></span></div></header>
+<nav class="main-nav" aria-label="功能导航">
+<button data-page="ethercat" class="selected" aria-current="page">EtherCAT 配置</button><button data-page="control">实时波形与控制</button><button data-page="bridge">中瑞桥接</button><button data-page="calibration">通道校准与物理量</button><button data-page="diagnostics">通信诊断 <span id="alarm-count"></span></button><button data-page="system">系统设置</button>
+</nav>
+<main>
+<div class="management"><span id="management-state">正在建立管理会话…</span><button id="claim" hidden>切换管理到本页</button><span id="config-warning" class="warning"></span></div>
+<p id="message" role="status" hidden></p>
+<section data-view="ethercat" aria-labelledby="ethercat-title">
+<div class="page-head"><div><p class="eyebrow">一 · 物理设备</p><h2 id="ethercat-title">EtherCAT 连接配置</h2><p>选择物理网卡后自动搜索并连接从站，输出从零值开始。</p></div></div>
+<article class="panel"><h3>选择 EtherCAT 接口</h3><div class="group"><label class="grow" for="adapters">专用有线网卡<select id="adapters"><option value="">读取网卡中…</option></select></label><button id="refresh">重新扫描网卡</button><button id="retry">重试连接</button><button id="disconnect">断开接口</button></div><p id="operation" class="notice" role="status"></p><p class="muted">刷新网页恢复当前状态。更换接口会先清零、停止发布并断开原接口。</p></article>
+<article class="panel"><h3>从站拓扑 <button class="info" data-help="从站是连接在 EtherCAT 总线上的设备。EK1100 是耦合器，EL3104 采集电压，EL4134 输出电压。">i</button></h3><div id="topology" class="topology"></div><p id="bus-summary" class="muted"></p><div class="table-wrap"><table><thead><tr><th>位置</th><th>设备</th><th>工作状态</th><th>说明</th></tr></thead><tbody id="devices"></tbody></table></div></article>
+<article class="panel"><div class="section-head"><h3>通信与同步设置</h3><button class="reload-config">读取已保存配置</button></div><p class="muted">同步与滤波会改变硬件运行方式。断开后保存，再选择接口或重试连接。</p><form id="hardware-form"><div id="hardware-fields" class="form-grid"></div><div class="group form-actions"><button class="primary">保存设置</button><button type="button" id="hardware-apply">停止任务并保存应用</button></div></form><p id="hardware-readback" class="notice"></p></article>
+<article class="panel"><h3>快速调整通信周期</h3><form id="period-form" class="group"><label for="period">目标周期 <button type="button" class="info" data-help="主站计划多久交换一组输入和输出。它不等于 ADC 独立转换速率，实际间隔请看通信诊断。">i</button></label><input id="period" type="number" min="1" max="50" value="10" required><span>ms</span><button>应用并保存周期</button><a href="#diagnostics">查看周期与抖动 →</a></form></article>
+</section>
+<section data-view="control" hidden aria-labelledby="scope-title">
+<div class="page-head"><div><p class="eyebrow">二 · 网页调试</p><h2 id="scope-title">实时波形与控制</h2><p>逐通道控制；TCP 正在使用的输出会明确标注归属。</p></div><button class="danger global-zero">全部清零并锁定</button></div>
+<div class="panel scope-toolbar"><div class="group"><select id="module-filter" aria-label="查看模块"><option value="">全部模块</option></select><span id="time-window">30.0 s · 实时</span><button id="zoom-in">− 时间窗</button><button id="zoom-out">+ 时间窗</button><button id="follow">回到实时</button></div><div class="group"><button id="arm">允许网页控制空闲通道</button><button id="record">开始记录</button><a class="button" id="export" href="/api/recording" hidden>下载 CSV</a></div></div>
+<h3>模拟量输出 <span>获通信回执的下发目标 · 端子电压请对照 AI 或万用表</span></h3><div class="chart-grid" id="outputs"></div>
+<h3>模拟量输入 <span>校准后电压 · 时间 / s · 滚轮缩放 · 拖拽框选</span></h3><div class="chart-grid" id="inputs"></div>
+</section>
+<section data-view="bridge" hidden aria-labelledby="bridge-title">
+<div class="page-head"><div><p class="eyebrow">三 · TCP 服务</p><h2 id="bridge-title">中瑞协议桥接</h2><p>添加原版或扩展虚拟卡，按通道指定读写权限。</p></div><button class="danger global-zero">全部清零并锁定</button></div>
+<article class="panel"><div class="group"><button id="bridge-add" class="primary">添加虚拟卡</button><select id="bridge-template-type" aria-label="模板类型"><option value="legacy">原版 8 AI＋2 AO</option><option value="extended">扩展全部通道</option></select><button id="bridge-template">从模板添加</button><button id="bridge-verify">按当前拓扑核对</button><button id="bridge-reload">放弃草稿并读取配置</button><button id="bridge-save">保存全部卡配置</button><button id="bridge-start">监听所有启用卡</button><button id="bridge-stop">停止全部虚拟卡</button></div><p id="bridge-config-state" class="notice"></p><p id="bridge-error" class="mapping-warning" role="status"></p><p id="bridge-source" class="muted"></p><p class="muted">只读映射可重复。每个真实 AO 只能有一个 TCP 写入映射；未占用通道可由网页控制。保持补点不会提高真实测量速率。</p></article>
+<div id="bridge-config"></div><div id="bridge-runtime"></div>
+</section>
+<section data-view="calibration" hidden aria-labelledby="calibration-title">
+<div class="page-head"><div><p class="eyebrow">四 · 通道参数</p><h2 id="calibration-title">通道校准与物理量</h2><p>电气校准和物理量映射独立启用，统一保存到本机后端。</p></div><div class="group"><button class="reload-config">读取已保存配置</button><button id="import-reference">迁入旧浏览器测量记录</button></div></div>
+<div class="notice">校准影响网页、TCP 和 CSV。请停止任务并断开接口后保存；物理量单位不改变原版中瑞协议的电压语义。</div>
+<form id="calibration-form"><div id="channel-settings"></div><div class="form-actions"><button class="primary">保存通道参数</button></div></form>
+</section>
+<section data-view="diagnostics" hidden aria-labelledby="diag-title">
+<div class="page-head"><div><p class="eyebrow">五 · 运行健康</p><h2 id="diag-title">通信诊断</h2><p>最近 30 分钟逐周期历史 · 指标统计最近 10 秒</p></div><a class="button" href="/api/diagnostics/export">导出诊断包</a></div>
+<dl class="metrics">
+<div><dt>目标周期 <button class="info" data-help="软件计划的 PDO 交换间隔；Windows 实际调度间隔可能更长或更短。">i</button></dt><dd id="target-metric">—</dd></div>
+<div><dt>实际周期间隔 <button class="info" data-help="相邻两次真实 PDO 交换开始时刻的差，包含 Windows 调度和本轮工作造成的影响。">i</button></dt><dd id="interval-metric">—</dd></div>
+<div><dt>收发耗时 <button class="info" data-help="主站发送 PDO 至接收返回所花时间；它不等于完整通信周期，也不等于 ADC 转换时间。">i</button></dt><dd id="roundtrip-metric">—</dd></div>
+<div><dt>实际更新率 <button class="info" data-help="按实际 PDO 交换间隔计算的数据更新率，独立于网页刷新及 TCP 逻辑补点率。">i</button></dt><dd id="rate-metric">—</dd></div>
+<div><dt>WKC 实际 / 预期 <button class="info" data-help="Working Counter 是从站处理本轮读写的计数回执。与拓扑预期一致表示所需读写获回应；−1 表示没有收到有效帧，单凭它不能判断是线缆还是接收超时。">i</button></dt><dd id="wkc">—</dd></div>
+<div><dt>通信异常 <button class="info" data-help="异常交换和运行故障计数。偶发异常先按已保存的容错策略处理，不等于已退出总线。">i</button></dt><dd id="error-metric">0</dd></div>
+<div><dt>调度漏期 <button class="info" data-help="主站来不及按计划运行而跳过的调度时隙；区别于网络丢帧和网页推送遗漏。">i</button></dt><dd id="missed-metric">0</dd></div>
+</dl>
+<p id="fault-detail" class="notice" role="status"></p><p id="viewer-drops" class="muted"></p>
+<article class="panel"><div class="section-head"><h3>周期与抖动时间线</h3><div class="group"><button id="diag-zoom-in">放大</button><button id="diag-zoom-out">缩小</button><button id="diag-follow">回到实时</button><span id="diag-window"></span></div></div><div class="diagnostic-plots"><div><h4>实际周期间隔 / ms</h4><div id="interval-chart"></div></div><div><h4>相对目标周期偏差 / ms</h4><div id="jitter-chart"></div></div><div><h4>主站收发耗时 / ms</h4><div id="roundtrip-chart"></div></div><div><h4>WKC 回执</h4><div id="wkc-chart"></div></div></div><p class="muted">横轴为本机时间；滚轮缩放、拖拽框选。事件标线用于对照配置变更和异常。</p></article>
+<article class="panel"><h3>最近 10 秒统计 <button class="info" data-help="P95 表示 95% 的有效样本不超过此值。最大值反映这段时间里最慢的一次。">i</button></h3><div class="table-wrap"><table><thead><tr><th>指标</th><th>最新</th><th>中位数</th><th>P95</th><th>最大</th><th>样本</th></tr></thead><tbody id="timing-details"></tbody></table></div></article>
+<article class="panel"><h3>通道报警</h3><div id="input-alarms" class="alarm-grid"></div></article>
+<article class="panel"><div class="section-head"><h3>事件与异常日志</h3><select id="event-filter" aria-label="事件分类"><option value="">全部事件</option><option value="connection">连接失败与恢复</option><option value="runtime">运行与通信异常</option><option value="alarm">通道报警</option><option value="control">控制与配置</option></select></div><div id="event-list"></div><p id="journal-error" class="warning"></p></article>
+</section>
+<section data-view="system" hidden aria-labelledby="system-title">
+<div class="page-head"><div><p class="eyebrow">六 · 后台运行</p><h2 id="system-title">系统设置</h2><p>配置一次后保存，源码与 EXE 共用本机设置。</p></div><button class="reload-config">读取已保存配置</button></div>
+<form id="system-form"><article class="panel"><h3>启动与无人值守</h3><div id="startup-fields" class="form-grid"></div><p id="login-status" class="muted"></p><p class="notice">无人值守按固定接口和拓扑启动，先确认零输出，再发布并授权虚拟卡；不重放上次非零输出。</p></article><article class="panel"><h3>通信容错与自动恢复</h3><div id="fault-fields" class="form-grid"></div><p class="muted">连续次数或持续时间任一达到阈值即进入故障策略。真实链路断开、退出 OP 或工作进程退出直接进入故障处理。</p></article><article class="panel"><h3>逐 AO 失联策略</h3><p class="muted">总线保持同时写入模块硬件看门狗。正常退出和人工清零仍请求 0 V；无通信时会标明无法确认。</p><div id="policy-fields" class="table-wrap"></div></article><div class="form-actions"><button class="primary">保存系统设置</button></div></form>
+<article class="panel"><h3>配置备份与恢复</h3><div class="group"><button id="config-export">导出配置</button><label class="button">导入配置<input type="file" id="config-import" accept=".json,application/json" hidden></label></div><p id="config-location" class="muted">保存在 %LOCALAPPDATA%\EtherCAT-Viewer\settings.json，自动保留上一版备份。</p><p class="muted">换电脑后重新核对网卡与拓扑；导入配置后仍需保存应用。</p></article>
+</section>
+</main><div id="tooltip" role="tooltip" hidden></div>
+</body></html>

@@ -554,4 +554,4 @@ def test_output_only_fault_keeps_empty_input_vectors_and_csv_width():
     worker.bus.close = lambda: False
     sample = worker.cycle(time.perf_counter_ns())
     assert sample["raw"] == sample["ai"] == sample["valid"] == sample["flags"] == []
-    assert len(next(csv.reader(io.StringIO(csv_rows([sample]))))) == 15
+    assert len(next(csv.reader(io.StringIO(csv_rows([sample]))))) == 19

@@ -1,249 +1,109 @@
 "use strict";
 class BridgePanel {
   constructor(post) {
-    this.post = post;
-    this.draft = null;
-    this.dirty = false;
-    this.addresses = ["127.0.0.1"];
-    this.channels = {ai: [], ao: []};
-    this.state = {};
-    document.getElementById("bridge-legacy").onclick = () => this.preset("legacy");
-    document.getElementById("bridge-extended").onclick = () => this.preset("extended");
+    this.post = post; this.draft = null; this.dirty = false; this.state = {}; this.channels = {ai:[],ao:[]};
+    this.addresses = ["127.0.0.1"]; this.open = new Set(); this.pages = new Map(); this.runtimeKey = "";
+    document.getElementById("bridge-reload").onclick=()=>{this.dirty=false;this.draft=null;this.configKey="";this.render(this.state,this.pending);};
+    document.getElementById("bridge-add").onclick = () => this.add("legacy", false);
+    document.getElementById("bridge-template").onclick = () => this.add(document.getElementById("bridge-template-type").value, true);
     document.getElementById("bridge-verify").onclick = () => {
-      if (this.draft && this.state.fingerprint) {
-        this.draft.fingerprint = this.state.fingerprint;
-        this.dirty = true;
-        this.drawConfig();
-      }
+      if (!this.state.fingerprint) return;
+      this.draft.fingerprint = this.state.fingerprint; this.dirty = true; this.drawConfig();
     };
-    document.getElementById("bridge-add").onclick = () => this.add();
     document.getElementById("bridge-save").onclick = async () => {
-      const response = await this.post("bridge_save", {config: this.draft});
-      if (response?.ok) {
-        this.dirty = false;
-        this.draft = structuredClone(response.config);
-        this.drawConfig();
-      }
+      const response = await this.post("bridge_save", {config:this.draft,revision:this.revision});
+      if (response?.ok) {this.draft = structuredClone(response.config);this.dirty = false;this.configKey = JSON.stringify(response.config);this.revision = response.result.config_revision;this.drawConfig();}
     };
     document.getElementById("bridge-start").onclick = () => this.post("bridge_start");
     document.getElementById("bridge-stop").onclick = () => this.post("bridge_stop");
-    document.getElementById("bridge-reclaim").onclick = () => this.post("zero");
-    fetch("/api/bridge/network").then(r => r.json()).then(data => {
-      this.addresses = data.addresses || this.addresses;
-      this.drawConfig();
-    }).catch(() => {});
+    fetch("/api/bridge/network").then(r=>r.json()).then(d=>{this.addresses=d.addresses||this.addresses;if(!this.dirty)this.drawConfig();}).catch(()=>{});
   }
-  async preset(profile) {
-    const response = await this.post("bridge_preset", {profile});
-    if (response?.ok) {
-      this.draft = structuredClone(response.config);
-      this.dirty = true;
-      this.drawConfig();
-    }
+  nextPort(profile) {
+    const used = new Set(this.draft.cards.map(c=>c.port));let port=profile==="legacy"?6000:7000;
+    while(used.has(port)&&port<65535)port++;return port;
   }
-  add() {
-    if (!this.draft) return;
-    const port = Math.max(5999, ...this.draft.cards.map(c => c.port)) + 1;
-    this.draft.cards.push({id: crypto.randomUUID().replaceAll("-", "").slice(0, 12),
-      name: "虚拟卡 " + (this.draft.cards.length + 1), enabled: true, profile: "legacy",
-      host: "127.0.0.1", port, allow: ["127.0.0.1/32"], ai: Array(8).fill(null), ao: Array(2).fill(null),
-      ao_range: "original", sampling: "hold", send_ms: 50, backlog_ms: 2000, saved_range: 2, saved_divider: 65000});
-    this.dirty = true;
-    this.drawConfig();
+  add(profile, mapped) {
+    this.draft ??= {version:1,fingerprint:this.state.fingerprint||"",cards:[]};
+    const ai = profile==="legacy"?Array(8).fill(null):Array(Math.max(1,this.channels.ai.length)).fill(null);
+    const ao = profile==="legacy"?Array(2).fill(null):Array(this.channels.ao.length).fill(null);
+    const occupied = new Set(this.draft.cards.flatMap(c=>c.ao.filter((v,i)=>v&&(c.ao_writable?.[i]??true)&&c.enabled)));
+    if(mapped){ai.forEach((_,i)=>ai[i]=this.channels.ai[i]?.id||null);ao.forEach((_,i)=>ao[i]=this.channels.ao[i]?.id||null);}
+    const id=crypto.randomUUID().replaceAll("-","").slice(0,12);
+    this.draft.cards.push({id,name:"虚拟卡 "+(this.draft.cards.length+1),enabled:true,profile,host:"127.0.0.1",port:this.nextPort(profile),allow:["127.0.0.1/32"],
+      ai,ao,ao_writable:ao.map(v=>!!v&&!occupied.has(v)),auto_reauthorize:true,ao_range:"original",sampling:"hold",send_ms:50,backlog_ms:2000,saved_range:2,saved_divider:65000});
+    this.open.add(id);this.dirty=true;this.drawConfig();
   }
-  field(parent, label, control) {
-    const box = document.createElement("label");
-    box.append(document.createTextNode(label), control);
-    parent.append(box);
-    return control;
-  }
-  select(options, value, change) {
-    const select = document.createElement("select");
-    for (const [key, label] of options) select.add(new Option(label, key));
-    if (value != null && value !== "" && !options.some(([key]) => key === value)) select.add(new Option("已失效：" + value, value));
-    select.value = value ?? "";
-    select.onchange = () => { this.dirty = true; change(select.value); };
-    return select;
-  }
-  input(value, type, change, min, max) {
-    const input = document.createElement("input");
-    input.type = type;
-    input.value = value;
-    if (min != null) input.min = min;
-    if (max != null) input.max = max;
-    input.onchange = () => { this.dirty = true; change(type === "number" ? input.valueAsNumber : input.value); };
-    return input;
-  }
-  drawConfig() {
-    const parent = document.getElementById("bridge-config");
-    parent.replaceChildren();
-    if (!this.draft) return;
-    for (const card of this.draft.cards) {
-      const details = document.createElement("details");
-      details.className = "virtual-card";
-      const summary = document.createElement("summary");
-      summary.textContent = card.name + " · " + (card.profile === "legacy" ? "中瑞原版" : "扩展 v1") +
-        " · " + card.ai.length + " AI / " + card.ao.length + " AO · " + card.host + ":" + card.port;
-      details.append(summary);
-      const fields = document.createElement("fieldset");
-      fields.className = "bridge-fields";
-      const group = document.createElement("div");
-      group.className = "bridge-grid";
-      this.field(group, "名称", this.input(card.name, "text", v => card.name = v));
-      this.field(group, "启用", this.select([["yes", "启用"], ["no", "停用"]], card.enabled ? "yes" : "no", v => card.enabled = v === "yes"));
-      this.field(group, "协议", this.select([["legacy", "中瑞原版（8 AI / 2 AO）"], ["extended", "扩展 v1（可变通道）"]],
-        card.profile, v => {
-          card.profile = v;
-          if (v === "legacy") {
-            card.ai = [...card.ai, ...Array(8).fill(null)].slice(0, 8);
-            card.ao = [...card.ao, null, null].slice(0, 2);
-          }
-          this.drawConfig();
-        }));
-      this.field(group, "监听地址", this.select(this.addresses.map(a => [a, a]), card.host, v => card.host = v));
-      this.field(group, "TCP 端口", this.input(card.port, "number", v => card.port = v, 1024, 65535));
-      this.field(group, "允许访问的 IPv4 / 网段，逗号分隔", this.input(card.allow.join(", "), "text",
-        v => card.allow = v.split(",").map(s => s.trim()).filter(Boolean)));
-      this.field(group, "AO 量程策略（原版协议）", this.select([["original", "保持 0–3.3 V"], ["bipolar", "0–3.3 V → −10 至 +10 V"]],
-        card.ao_range, v => { card.ao_range = v; this.drawConfig(); }));
-      this.field(group, "采样策略", this.select([["hold", "兼容保持：允许补点"], ["native", "真实采样：不补点"]],
-        card.sampling, v => card.sampling = v));
-      this.field(group, "发送批量 / ms", this.input(card.send_ms, "number", v => card.send_ms = v, 5, 1000));
-      this.field(group, "最大积压 / ms", this.input(card.backlog_ms, "number", v => card.backlog_ms = v, 100, 10000));
-      if (card.profile === "extended") {
-        for (const kind of ["ai", "ao"]) this.field(group, kind.toUpperCase() + " 数量",
-          this.input(card[kind].length, "number", v => {
-            if (!Number.isInteger(v) || v < (kind === "ai" ? 1 : 0) || v > 65535) return;
-            card[kind] = Array.from({length: v}, (_, i) => card[kind][i] ?? null);
-            this.drawConfig();
-          }, kind === "ai" ? 1 : 0, 65535));
-      }
+  field(parent,label,control){const box=document.createElement("label");control.dataset.field=label;box.append(document.createTextNode(label),control);parent.append(box);return control;}
+  select(options,value,change){const node=document.createElement("select");for(const[k,v]of options)node.add(new Option(v,k));if(value!=null&&value!==""&&!options.some(([k])=>k===value))node.add(new Option("已失效："+value,value));node.value=value??"";node.onchange=()=>{this.dirty=true;change(node.value);this.renderControls();};return node;}
+  input(value,type,change,min,max){const node=document.createElement("input");node.type=type;node.value=value;if(min!=null)node.min=min;if(max!=null)node.max=max;node.onchange=()=>{this.dirty=true;change(type==="number"?node.valueAsNumber:node.value);this.renderControls();};return node;}
+  note(message){document.getElementById("bridge-error").textContent=message;}
+  drawConfig(){
+    const parent=document.getElementById("bridge-config");for(const node of parent.children)if(node.open)this.open.add(node.dataset.id);else this.open.delete(node.dataset.id);
+    parent.replaceChildren();if(!this.draft)return;
+    for(const card of this.draft.cards){
+      card.ao_writable??=card.ao.map(()=>true);card.auto_reauthorize??=true;
+      const details=document.createElement("details");details.dataset.id=card.id;details.className="virtual-card panel";details.open=this.open.has(card.id);
+      const summary=document.createElement("summary");summary.textContent=card.name+" · "+(card.profile==="legacy"?"原版":"扩展 v1")+" · "+card.ai.length+" AI / "+card.ao.length+" AO · "+card.host+":"+card.port;details.append(summary);
+      const fields=document.createElement("fieldset");fields.className="bridge-fields";fields.dataset.card=card.id;
+      const group=document.createElement("div");group.className="form-grid";
+      this.field(group,"名称",this.input(card.name,"text",v=>card.name=v));
+      this.field(group,"启用",this.select([["yes","启用"],["no","停用"]],card.enabled?"yes":"no",v=>card.enabled=v==="yes"));
+      this.field(group,"协议类型",this.select([["legacy","原版 8 AI＋2 AO"],["extended","扩展 v1 · 可变通道"]],card.profile,v=>{
+        const lost=card.ai.slice(8).filter(Boolean).length+card.ao.slice(2).filter(Boolean).length;
+        if(v==="legacy"){card.ai=Array.from({length:8},(_,i)=>card.ai[i]??null);card.ao=Array.from({length:2},(_,i)=>card.ao[i]??null);card.ao_writable=Array.from({length:2},(_,i)=>card.ao_writable[i]??false);}
+        card.profile=v;this.note(lost?"切换为原版后移除 "+lost+" 个超出通道范围的映射；保存前可重新核对。":"协议类型已修改，原有范围内映射已保留。");this.drawConfig();
+      }));
+      this.field(group,"监听地址",this.select(this.addresses.map(a=>[a,a]),card.host,v=>card.host=v));
+      this.field(group,"TCP 端口",this.input(card.port,"number",v=>card.port=v,1024,65535));
+      this.field(group,"允许 IPv4 / 网段（逗号分隔）",this.input(card.allow.join(", "),"text",v=>card.allow=v.split(",").map(s=>s.trim()).filter(Boolean)));
+      this.field(group,"断开后允许自动重新接管",this.select([["yes","允许 · 先归零再接收新指令"],["no","等待网页再次授权"]],card.auto_reauthorize?"yes":"no",v=>card.auto_reauthorize=v==="yes"));
+      this.field(group,"原版 AO 量程",this.select([["original","保持中瑞 0–3.3 V"],["bipolar","映射到 −10 至 +10 V"]],card.ao_range,v=>{card.ao_range=v;}));
+      this.field(group,"采样策略",this.select([["hold","兼容保持 · 可补点"],["native","真实采样 · 不补点"]],card.sampling,v=>card.sampling=v));
+      this.field(group,"发送批量 / ms",this.input(card.send_ms,"number",v=>card.send_ms=v,5,1000));
+      this.field(group,"积压上限 / ms",this.input(card.backlog_ms,"number",v=>card.backlog_ms=v,100,10000));
+      if(card.profile==="extended")for(const kind of["ai","ao"])this.field(group,kind.toUpperCase()+" 数量",this.input(card[kind].length,"number",v=>{
+        if(!Number.isInteger(v)||v<(kind==="ai"?1:0)||v>65535){this.note("通道数量无效");return;}
+        const removed=card[kind].slice(v).filter(Boolean).length;card[kind]=Array.from({length:v},(_,i)=>card[kind][i]??null);
+        if(kind==="ao")card.ao_writable=Array.from({length:v},(_,i)=>card.ao_writable[i]??false);
+        this.note(removed?"缩减将移除 "+removed+" 个映射，请核对后保存。":"通道数量已调整");this.drawConfig();
+      },kind==="ai"?1:0,65535));
       fields.append(group);
-      const note = document.createElement("p");
-      note.className = card.profile === "legacy" && card.ao_range === "bipolar" ? "mapping-warning" : "muted";
-      note.textContent = card.profile === "extended" ? "扩展输出直接使用物理电压，支持 ±10 V。" :
-        card.ao_range === "bipolar" ? "双极性映射：码值 0 → −10 V；2048 → 约 +2.44 mV；4095 → +10 V。软件发送码值 0 会到 −10 V。清零与断线始终回到物理 0 V。" :
-        "原版 DAC 0–4095 对应物理 0–3.3 V。通道选择值 3 仍表示两路同时设置。";
-      fields.append(note);
-      const maps = document.createElement("div");
-      maps.className = "bridge-mappings";
-      for (const kind of ["ai", "ao"]) {
-        const column = document.createElement("div");
-        const h = document.createElement("h4");
-        h.textContent = kind.toUpperCase() + " 通道映射";
-        column.append(h);
-        card[kind].forEach((value, i) => {
-          this.field(column, kind.toUpperCase() + (kind === "ai" ? i : i + 1),
-            this.select([["", kind === "ai" ? "未接入（固定零值）" : "未映射（拒绝输出）"],
-              ...this.channels[kind].map(c => [c.id, c.label])], value, v => card[kind][i] = v || null));
-        });
-        maps.append(column);
-      }
-      fields.append(maps);
-      const remove = document.createElement("button");
-      remove.textContent = "删除这张虚拟卡";
-      remove.type = "button";
-      remove.onclick = () => {
-        this.draft.cards = this.draft.cards.filter(c => c !== card);
-        this.dirty = true;
-        this.drawConfig();
-      };
-      fields.append(remove);
-      details.append(fields);
-      parent.append(details);
-    }
-    this.renderControls();
+      const note=document.createElement("p");note.className="notice";note.textContent=card.profile==="legacy"?"原版固定 8 AI＋2 AO，选择值 3 表示两路同时操作。双极性映射中码值 0 是 −10 V；人工清零直接使用物理零目标。":"扩展直接使用物理电压；数量还受 1 MiB 单帧及发送缓冲限制。";fields.append(note);
+      const maps=document.createElement("div");maps.className="bridge-mappings";
+      for(const kind of["ai","ao"]){const column=document.createElement("div"),h=document.createElement("h4");h.textContent=kind.toUpperCase()+" 映射";column.append(h);
+        const key=card.id+kind,pages=Math.max(1,Math.ceil(card[kind].length/32)),page=Math.min(this.pages.get(key)||0,pages-1);
+        if(pages>1){const select=this.select(Array.from({length:pages},(_,i)=>[String(i),"第 "+(i+1)+" / "+pages+" 页"]),String(page),v=>{this.pages.set(key,+v);this.drawConfig();});column.append(select);}
+        card[kind].slice(page*32,page*32+32).forEach((value,j)=>{const i=page*32+j,row=document.createElement("div");row.className="map-row";
+          this.field(row,kind.toUpperCase()+(kind==="ai"?i:i+1),this.select([["",kind==="ai"?"未接入 · 固定零":"未映射"],...this.channels[kind].map(c=>[c.id,c.label])],value,v=>card[kind][i]=v||null));
+          if(kind==="ao")this.field(row,"权限",this.select([["read","只读"],["write","唯一写入者"]],card.ao_writable[i]?"write":"read",v=>card.ao_writable[i]=v==="write"));column.append(row);
+        });maps.append(column);
+      }fields.append(maps);
+      const actions=document.createElement("div");actions.className="group";
+      const copy=document.createElement("button");copy.type="button";copy.textContent="复制为只读卡";copy.onclick=()=>{const c=structuredClone(card);c.id=crypto.randomUUID().replaceAll("-","").slice(0,12);c.name+=" 副本";c.port=this.nextPort(c.profile);c.ao_writable=c.ao.map(()=>false);this.draft.cards.push(c);this.dirty=true;this.open.add(c.id);this.drawConfig();};
+      const remove=document.createElement("button");remove.type="button";remove.className="danger";remove.textContent="删除本卡";remove.onclick=()=>{this.note("将删除 "+card.name+"："+card.ai.filter(Boolean).length+" 个 AI 映射、"+card.ao.filter(Boolean).length+" 个 AO 映射。保存前可读取原配置恢复。");this.draft.cards=this.draft.cards.filter(c=>c!==card);this.dirty=true;this.drawConfig();};actions.append(copy,remove);fields.append(actions);details.append(fields);parent.append(details);
+    }this.renderControls();
   }
-  renderControls() {
-    const permitted = this.state.controller && !this.state.pending;
-    const active = this.state.bridge?.active;
-    for (const button of document.querySelectorAll("#bridge-runtime button[data-card]")) {
-      const card = (this.state.bridge?.cards || []).find(c => c.id === button.dataset.card);
-      button.disabled = !permitted || !active || !card || !!card.controller || card.authorized;
-    }
-    for (const fieldset of document.querySelectorAll("#bridge-config fieldset")) fieldset.disabled = !permitted || active;
-    for (const id of ["bridge-legacy", "bridge-extended"]) document.getElementById(id).disabled =
-      !permitted || active || this.state.connection !== "OP";
-    document.getElementById("bridge-verify").disabled = !permitted || active || !this.draft || !this.state.fingerprint;
-    document.getElementById("bridge-config-state").textContent = this.dirty ? "配置尚未保存，请核对映射后保存。" : this.draft?.fingerprint && this.state.fingerprint && this.draft.fingerprint !== this.state.fingerprint ? "设备拓扑已变化，请核对模块和通道，再按当前拓扑重新核对并保存。" : "配置只保存映射与参数；重启后输出锁定，需手动连接和发布。";
-    document.getElementById("bridge-add").disabled = !permitted || active || !this.draft?.fingerprint;
-    document.getElementById("bridge-save").disabled = !permitted || active || !this.draft?.fingerprint;
-    document.getElementById("bridge-start").disabled = !permitted || active || this.dirty || this.state.connection !== "OP";
-    document.getElementById("bridge-stop").disabled = !permitted || !active;
-    document.getElementById("bridge-reclaim").disabled = !this.state.controller || this.state.connection !== "OP";
+  renderControls(){const permitted=this.state.controller&&!this.pending,active=new Set((this.state.bridge?.cards||[]).map(c=>c.id));
+    for(const f of document.querySelectorAll("#bridge-config fieldset"))f.disabled=!permitted||active.has(f.dataset.card);
+    for(const id of["bridge-add","bridge-template"])document.getElementById(id).disabled=!permitted;
+    document.getElementById("bridge-verify").disabled=!permitted||!this.state.fingerprint||!!this.state.bridge?.active;
+    document.getElementById("bridge-save").disabled=!permitted||!this.draft;
+    document.getElementById("bridge-start").disabled=!permitted||!this.state.ready||this.dirty||!this.draft?.cards.some(c=>c.enabled&&!active.has(c.id));
+    document.getElementById("bridge-stop").disabled=!permitted||!this.state.bridge?.active;
+    document.getElementById("bridge-config-state").textContent=this.dirty?"有未保存修改。保存后才能按新配置监听。":this.draft?.fingerprint&&this.state.fingerprint&&this.draft.fingerprint!==this.state.fingerprint?"拓扑已改变：核对映射后重新确认。":"配置已保存；输出归属与发布状态由后台维护。";
   }
-  render(state, pending) {
-    this.state = {...state, pending};
-    const bridge = state.bridge || {};
-    const channelKey = JSON.stringify(state.channels || {ai: [], ao: []});
-    if (!this.draft || (!this.dirty && this.configKey !== JSON.stringify(bridge.config))) {
-      this.draft = bridge.config ? structuredClone(bridge.config) : null;
-      this.configKey = JSON.stringify(bridge.config);
-      this.channels = state.channels || {ai: [], ao: []};
-      this.drawConfig();
-    } else if (this.channelKey !== channelKey) {
-      this.channels = state.channels || {ai: [], ao: []};
-      this.drawConfig();
-    }
-    this.channelKey = channelKey;
-    document.getElementById("bridge-mode").textContent = bridge.active ? "TCP 接管 · 网页只读监视" : "网页调试";
-    document.getElementById("bridge-source").textContent = "实际源数据 " +
-      (Number.isFinite(bridge.native_hz) ? bridge.native_hz.toFixed(1) + " Hz" : "—") +
-      " · 原始批量 50 ms · 时间戳为主机 PDO 交换时刻";
-    document.getElementById("bridge-error").textContent = bridge.last_error || "";
-    const runtime = document.getElementById("bridge-runtime");
-    const runtimeKey = JSON.stringify(bridge.cards);
-    if (runtime.dataset.key !== runtimeKey) {
-      runtime.dataset.key = runtimeKey;
-      runtime.replaceChildren();
-      for (const card of bridge.cards || []) {
-        const box = document.createElement("article");
-        box.className = "bridge-status";
-        const h = document.createElement("h3");
-        h.textContent = card.name + " · " + card.address;
-        const line = document.createElement("p");
-        line.textContent = (card.controller ? "控制端 " + card.controller : card.authorized ? "已授权，等待控制端" : "输出锁定") +
-          " · 连接 " + card.connections + " · 物理 AO " + card.physical_ao.map(v => Number.isFinite(v) ? v.toFixed(3) + " V" : "—").join(" / ");
-        const authorize = document.createElement("button");
-        authorize.dataset.card = card.id;
-        authorize.textContent = card.authorized ? "已授权" : "授权此卡 TCP 接管";
-        authorize.disabled = !state.controller || pending || !bridge.active || !!card.controller || card.authorized;
-        authorize.onclick = () => this.post("bridge_authorize", {card: card.id});
-        box.append(h, line, authorize);
-        const sessions = card.sessions.length ? card.sessions : [card.last_stats];
-        for (const stats of sessions) {
-          if (!stats || !Object.keys(stats).length) continue;
-          const p = document.createElement("p");
-          p.className = "muted";
-          p.textContent = (stats.peer || "上次连接") + " · " + (stats.controller ? "控制" : "只读") +
-            " · 逻辑 " + (stats.rate_hz ?? "—") + " Hz · 源样本 " + stats.sources + " · 保持补点 " + stats.held +
-            " · 已发 " + stats.sent_samples + " 点 · 积压 " + (stats.queued_bytes / 1024).toFixed(1) + " KiB" +
-            " · 缓冲延迟 " + (stats.latency_ms == null ? "—" : stats.latency_ms.toFixed(1) + " ms");
-          box.append(p);
-          if (stats.last_output?.length) {
-            const output = document.createElement("p");
-            output.textContent = stats.last_output.map(o => "AO" + o.channel + " 指令 " +
-              (o.software_v == null ? "扩展电压" : o.software_v.toFixed(4) + " V / 码 " + o.code) +
-              " → 物理目标 " + o.physical_v.toFixed(4) + " V").join("；");
-            box.append(output);
-          }
-        }
-        for (const stats of sessions) for (const wave of stats?.wave_info || []) {
-          const line = document.createElement("p");
-          line.className = wave.warning ? "mapping-warning" : "muted";
-          line.textContent = "AO" + wave.channel + " 表波形 " + wave.frequency_hz.toFixed(3) + " Hz · " + wave.table_points + " 个原表点 · 每周期约 " + (wave.actual_points_per_cycle == null ? "—" : wave.actual_points_per_cycle.toFixed(1)) + " 次实际更新" + (wave.warning ? " · 台阶明显" : "");
-          box.append(line);
-        }
-        if (card.error) {
-          const err = document.createElement("p");
-          err.className = "mapping-warning";
-          err.textContent = card.error;
-          box.append(err);
-        }
-        runtime.append(box);
-      }
-    }
-    document.getElementById("bridge-events").textContent = (bridge.events || []).slice(-8).map(e => e.message).join("\n");
-    this.renderControls();
+  render(state,pending,config){this.state=state;this.pending=pending;this.channels=state.fingerprint?state.channels:(config?.topology?.channels||this.channels);
+    const bridge=state.bridge||{};
+    if(!this.draft||!this.dirty&&this.configKey!==JSON.stringify(bridge.config)){this.draft=structuredClone(bridge.config||{version:1,fingerprint:state.fingerprint||"",cards:[]});this.configKey=JSON.stringify(bridge.config);this.revision=state.config_revision;this.drawConfig();}
+    if(!this.dirty)this.revision=state.config_revision;
+    document.getElementById("bridge-source").textContent="有效 PDO 更新率 "+(Number.isFinite(bridge.native_hz)?bridge.native_hz.toFixed(1)+" Hz":"—")+" · 后台采集独立于网页刷新"+(bridge.suspended?" · 正在等待总线恢复":"");
+    if(bridge.last_error)document.getElementById("bridge-error").textContent=bridge.last_error;
+    const runtime=document.getElementById("bridge-runtime"),key=JSON.stringify((bridge.cards||[]).map(c=>c.id));
+    if(key!==this.runtimeKey){this.runtimeKey=key;runtime.replaceChildren();for(const card of bridge.cards||[]){const box=document.createElement("article");box.className="panel bridge-status";box.dataset.card=card.id;box.innerHTML='<h3></h3><p class="owner-line"></p><p class="stats-line muted"></p><p class="card-error warning"></p><div class="group"><button class="authorize">允许 TCP 控制本卡输出</button><button class="stop-card">停止本卡并清零</button></div>';box.querySelector(".authorize").onclick=()=>this.post("bridge_authorize",{card:card.id});box.querySelector(".stop-card").onclick=()=>this.post("bridge_stop",{card:card.id});runtime.append(box);}}
+    for(const card of bridge.cards||[]){const box=[...runtime.children].find(n=>n.dataset.card===card.id);box.querySelector("h3").textContent=card.name+" · "+card.address;
+      box.querySelector(".owner-line").textContent=(card.controller?"控制端 "+card.controller:card.authorized?"已授权，等待客户端":"输出未授权")+" · "+card.connections+" 个连接 · AO "+card.physical_ao.map(v=>Number.isFinite(v)?v.toFixed(3)+" V":"—").join(" / ");
+      box.querySelector(".stats-line").textContent=(card.sessions||[]).map(s=>(s.controller?"控制":"只读")+" "+s.peer+" · "+(s.rate_hz??"—")+" 逻辑 Hz · 有效源 "+s.sources+" · 补点 "+s.held+" · 积压 "+s.queued_bytes+" B · 延迟 "+(s.latency_ms?.toFixed(1)??"—")+" ms").join("；");
+      box.querySelector(".card-error").textContent=card.error||"";box.querySelector(".authorize").disabled=!state.controller||pending||!state.ready||!!card.controller||card.authorized;box.querySelector(".stop-card").disabled=!state.controller||pending;
+    }this.renderControls();
   }
 }

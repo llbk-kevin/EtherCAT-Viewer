@@ -13,7 +13,12 @@ class Sampler:
         self.fresh_ns = max(100_000_000, round(3e9 / target_rate))
         self.previous = None
         self.origin = None
+        self.epoch_generated = 0
         self.generated = self.held = self.sources = self.clipped = 0
+
+    def pause(self):
+        self.previous = self.origin = None
+        self.epoch_generated = self.generated
 
     def vector(self, sample):
         values, valid, mapped, clipped = [], [], [], []
@@ -51,18 +56,18 @@ class Sampler:
         chunks = []
         if self.policy == "native":
             # Select at most one new physical sample; never manufacture native samples.
-            desired = self.origin + self.generated * 1e9 / self.rate
+            desired = self.origin + (self.generated-self.epoch_generated) * 1e9 / self.rate
             if stamp >= desired:
                 chunks.append((row, 1, self.metadata(sample, stamp, 0, valid, mapped, clipped)))
                 self.generated += 1
         elif previous is not None:
             end = math.ceil((stamp - self.origin) * self.rate / 1e9 - 1e-9)
-            count = max(0, end - self.generated)
+            count = max(0, end - (self.generated-self.epoch_generated))
             if count:
                 old, old_row, old_valid, old_mapped, old_clipped = previous
                 if len(old_row)*count > 512*1024:
                     raise ValueError("数据块过大，请减少虚拟通道数或逻辑采样率")
-                start = self.origin + round(self.generated * 1e9 / self.rate)
+                start = self.origin + round((self.generated-self.epoch_generated) * 1e9 / self.rate)
                 chunks.append((old_row * count, count,
                                self.metadata(old, start, count-1, old_valid, old_mapped, old_clipped)))
                 self.generated += count

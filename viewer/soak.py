@@ -5,6 +5,7 @@ import time
 
 from .hardware import Hardware, adapter_guid
 from .paths import data_root
+from .settings import Settings
 
 def main():
     parser = argparse.ArgumentParser(description="EtherCAT 零输出长测")
@@ -22,7 +23,9 @@ def main():
     intervals, roundtrips = [], []
     report = {"target_period_ms": 10, "duration_s": duration, "cycles": 0, "wkc_errors": 0}
     try:
-        bus.configure()
+        configuration = Settings().data
+        configuration["hardware"]["period_ms"] = 10
+        bus.configure(configuration)
         report.update(devices=bus.devices, mapping=bus.mapping, expected_wkc=bus.expected,
                       watchdog_ms=bus.watchdog)
         start = time.perf_counter_ns()
@@ -33,7 +36,7 @@ def main():
             if previous is not None:
                 intervals.append((now - previous) / 1e6)
             previous = now
-            counter = bus.exchange([0.0] * len(bus.channels["ao"]))
+            counter = bus.exchange(bus.zero_values)
             roundtrips.append((time.perf_counter_ns() - now) / 1e6)
             report["cycles"] += 1
             if counter != bus.expected:

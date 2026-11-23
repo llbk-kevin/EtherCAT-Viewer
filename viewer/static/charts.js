@@ -152,6 +152,7 @@ class SharedCharts {
   }
 
   schedule() {
+    if (this.visible && !this.visible()) return;
     if (this.frame !== null) return;
     this.frame = requestAnimationFrame(now => {
       this.frame = null;
@@ -165,6 +166,7 @@ class SharedCharts {
   }
 
   draw() {
+    if (this.visible && !this.visible()) return;
     if (this.following) {
       this.to = Math.max(this.width, this.rows.at(-1)?.x ?? 0);
       this.from = this.to - this.width;
